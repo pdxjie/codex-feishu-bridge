@@ -118,6 +118,16 @@ export class CodexClient extends EventEmitter {
     return response.project;
   }
 
+  async createProject(name: string, roots: string[], idempotencyKey: string): Promise<CodexProject> {
+    const response = await this.rpc.request<{ project: CodexProject }>("project/create", {
+      name,
+      roots: roots.map((path) => ({ path })),
+      metadata: {},
+      idempotencyKey,
+    });
+    return response.project;
+  }
+
   async readThread(threadId: string): Promise<CodexThread> {
     const response = await this.rpc.request<{ thread: CodexThread }>("thread/read", {
       threadId,

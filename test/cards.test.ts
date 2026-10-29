@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { guestSessionsCard, projectThreadsCard, projectsCard, sessionsCard } from "../src/feishu/cards.js";
+import { guestHelpCard, projectThreadsCard, projectsCard, sessionsCard } from "../src/feishu/cards.js";
 
 test("会话卡片包含切换动作和当前会话标记", () => {
   const card = sessionsCard(
@@ -22,17 +22,11 @@ test("会话卡片包含切换动作和当前会话标记", () => {
   assert.match(serialized, /当前会话/);
 });
 
-test("访客会话卡片只提供访客切换和新建动作", () => {
-  const serialized = JSON.stringify(
-    guestSessionsCard(
-      [{ threadId: "guest-1", openId: "ou_guest", title: "订单排查", createdAt: 1, updatedAt: 1 }],
-      "guest-1",
-    ),
-  );
-  assert.match(serialized, /guest_switch_thread/);
-  assert.match(serialized, /guest_new_thread/);
+test("访客帮助卡只提示直接聊天，不暴露项目或会话管理入口", () => {
+  const serialized = JSON.stringify(guestHelpCard());
+  assert.match(serialized, /自主排查/);
   assert.match(serialized, /生产只读/);
-  assert.doesNotMatch(serialized, /"action":"switch_thread"|new_in_project/);
+  assert.doesNotMatch(serialized, /sessions|projects|guest_switch_thread|guest_new_thread|new_in_project/);
 });
 
 test("项目卡片包含查看和新建会话操作", () => {

@@ -34,12 +34,16 @@ test("保存用户当前会话和任务路由", () => {
   }
 });
 
-test("访客会话按 open_id 隔离并记录访客任务路由", () => {
+test("每个访客固定绑定唯一会话并记录访客任务路由", () => {
   const directory = mkdtempSync(join(tmpdir(), "codex-feishu-guest-store-"));
   const store = new StateStore(join(directory, "state.db"));
   try {
-    store.addGuestThread("ou_a", "guest-thread-a", "A 的排查");
+    const first = store.addGuestThread("ou_a", "guest-thread-a", "自主排查@A");
+    const duplicate = store.addGuestThread("ou_a", "guest-thread-a-duplicate", "自主排查@A");
     store.addGuestThread("ou_b", "guest-thread-b", "B 的排查");
+    assert.equal(first.threadId, "guest-thread-a");
+    assert.equal(duplicate.threadId, "guest-thread-a");
+    assert.equal(store.getGuestThreadForUser("ou_a")?.threadId, "guest-thread-a");
     assert.deepEqual(store.listGuestThreads("ou_a").map((thread) => thread.threadId), ["guest-thread-a"]);
     assert.equal(store.getGuestThread("guest-thread-a")?.openId, "ou_a");
 

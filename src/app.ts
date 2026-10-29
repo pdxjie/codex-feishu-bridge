@@ -234,8 +234,16 @@ export class BridgeApp {
       throw new Error("你的固定诊断会话已有任务正在执行，请等待本次任务完成后继续提问。");
     }
 
-    const turnId = await this.guestCodex.startReadOnlyTurn(threadId, this.config.guestWorkspaceRoot, text);
-    this.activeTurns.set(threadId, turnId);
+    const startingTurnId = `guest-starting-${randomUUID()}`;
+    this.activeTurns.set(threadId, startingTurnId);
+    let turnId: string;
+    try {
+      turnId = await this.guestCodex.startReadOnlyTurn(threadId, this.config.guestWorkspaceRoot, text);
+      this.activeTurns.set(threadId, turnId);
+    } catch (error) {
+      if (this.activeTurns.get(threadId) === startingTurnId) this.activeTurns.delete(threadId);
+      throw error;
+    }
     this.store.setTurnRoute(threadId, turnId, openId, chatId, "guest");
     this.store.touchGuestThread(threadId);
     const progress: LiveProgressState = {
@@ -307,16 +315,30 @@ export class BridgeApp {
   private async resolveGuestProject(): Promise<void> {
     if (!this.config.guestWorkspaceRoot) return;
     const projects = await this.codex.listProjects();
-    const project = projects.find((candidate) => candidate.name === GUEST_PROJECT_NAME);
-    if (!project) throw new Error(`Codex Desktop 中不存在“${GUEST_PROJECT_NAME}”项目。`);
-    const ownsGuestRoot = project.roots.some((root) => resolve(root.path) === resolve(this.config.guestWorkspaceRoot!));
+    const desktopProject = projects.find((candidate) => candidate.name === GUEST_PROJECT_NAME);
+    if (!desktopProject) throw new Error(`Codex Desktop 中不存在“${GUEST_PROJECT_NAME}”项目。`);
+    const ownsGuestRoot = desktopProject.roots.some((root) => resolve(root.path) === resolve(this.config.guestWorkspaceRoot!));
     if (!ownsGuestRoot) {
       throw new Error(`“${GUEST_PROJECT_NAME}”项目目录必须是 ${this.config.guestWorkspaceRoot}。`);
     }
-    this.guestProjectId = project.id;
+    if (!this.guestCodex) throw new Error("访客只读执行器未启用。");
+    const guestProjects = await this.guestCodex.listProjects();
+    const guestProject =
+      guestProjects.find(
+        (candidate) =>
+          candidate.name === GUEST_PROJECT_NAME &&
+          candidate.roots.some((root) => resolve(root.path) === resolve(this.config.guestWorkspaceRoot!)),
+      ) ??
+      (await this.guestCodex.createProject(
+        GUEST_PROJECT_NAME,
+        [this.config.guestWorkspaceRoot],
+        `codex-feishu-bridge:${GUEST_PROJECT_NAME}:${this.config.guestWorkspaceRoot}`,
+      ));
+    this.guestProjectId = guestProject.id;
     this.logger.info("访客已固定到 Codex 项目", {
-      projectId: project.id,
-      projectName: project.name,
+      desktopProjectId: desktopProject.id,
+      guestExecutionProjectId: guestProject.id,
+      projectName: guestProject.name,
       workspace: this.config.guestWorkspaceRoot,
     });
   }
