@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { guestHelpCard, projectThreadsCard, projectsCard, sessionsCard } from "../src/feishu/cards.js";
+import {
+  guestHelpCard,
+  projectThreadsCard,
+  projectsCard,
+  sessionsCard,
+  threadResultCard,
+} from "../src/feishu/cards.js";
 
 test("会话卡片包含切换动作和当前会话标记", () => {
   const card = sessionsCard(
@@ -22,10 +28,12 @@ test("会话卡片包含切换动作和当前会话标记", () => {
   assert.match(serialized, /当前会话/);
 });
 
-test("访客帮助卡只提示直接聊天，不暴露项目或会话管理入口", () => {
+test("访客帮助卡提供新建和停止快捷指令但不暴露会话管理入口", () => {
   const serialized = JSON.stringify(guestHelpCard());
   assert.match(serialized, /自主排查/);
   assert.match(serialized, /生产只读/);
+  assert.match(serialized, /\/new/);
+  assert.match(serialized, /\/stop/);
   assert.doesNotMatch(serialized, /sessions|projects|guest_switch_thread|guest_new_thread|new_in_project/);
 });
 
@@ -69,4 +77,34 @@ test("项目卡片包含查看和新建会话操作", () => {
   );
   assert.match(threadCard, /switch_thread/);
   assert.match(threadCard, /在项目中新建会话/);
+});
+
+test("最终结果将 Markdown 表格渲染为移动端友好的明细卡片", () => {
+  const result = threadResultCard(
+    "自主排查@测试同事",
+    [
+      "查到 SKU `G37007BR05A-YF` 的采购明细。",
+      "",
+      "| 采购单号 | 状态 | 数量 | 已出运 |",
+      "|---|---|---:|---:|",
+      "| KA26UG08415-US | 计划中 | 535 | 509 |",
+      "| KA26UG08413-AU | 计划中 | 28 | 3 |",
+      "",
+      "- 剩余共 **51** 件",
+    ].join("\n"),
+  );
+  const serialized = JSON.stringify(result);
+  assert.match(serialized, /📋 查询明细（2 条）/);
+  assert.match(serialized, /采购单号.*KA26UG08415-US/);
+  assert.match(serialized, /状态.*计划中/);
+  assert.match(serialized, /剩余共 \*\*51\*\* 件/);
+  assert.doesNotMatch(serialized, /\|---\|/);
+});
+
+test("可识别经过消息转义的 Markdown 表格竖线", () => {
+  const result = JSON.stringify(
+    threadResultCard("自主排查@测试同事", "\\| 字段 \\| 值 \\|\n\\|---\\|---\\|\n\\| SKU \\| `ABC-1` \\|"),
+  );
+  assert.match(result, /📋 查询明细（1 条）/);
+  assert.doesNotMatch(result, /\\\\\|---/);
 });

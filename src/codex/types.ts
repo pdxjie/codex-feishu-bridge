@@ -59,6 +59,10 @@ export type TurnStartResponse = {
   turn: CodexTurn;
 };
 
+export type CodexUserInput =
+  | { type: "text"; text: string; text_elements: [] }
+  | { type: "image"; url: string; detail?: "auto" | "low" | "high" | "original" };
+
 export type CodexNotification = {
   method: string;
   params?: Record<string, unknown>;

@@ -14,6 +14,7 @@ export type GuestThread = {
   threadId: string;
   openId: string;
   title: string;
+  desktopManaged: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -53,6 +54,7 @@ export class StateStore {
         thread_id TEXT PRIMARY KEY,
         open_id TEXT NOT NULL,
         title TEXT NOT NULL,
+        desktop_managed INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -85,6 +87,10 @@ export class StateStore {
     const routeColumns = this.db.prepare("PRAGMA table_info(turn_routes)").all() as Array<{ name: string }>;
     if (!routeColumns.some((column) => column.name === "role")) {
       this.db.exec("ALTER TABLE turn_routes ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'");
+    }
+    const guestColumns = this.db.prepare("PRAGMA table_info(guest_threads)").all() as Array<{ name: string }>;
+    if (!guestColumns.some((column) => column.name === "desktop_managed")) {
+      this.db.exec("ALTER TABLE guest_threads ADD COLUMN desktop_managed INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -159,7 +165,7 @@ export class StateStore {
       .run(openId, chatId, Date.now());
   }
 
-  addGuestThread(openId: string, threadId: string, title: string): GuestThread {
+  addGuestThread(openId: string, threadId: string, title: string, desktopManaged = false): GuestThread {
     const now = Date.now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -170,15 +176,40 @@ export class StateStore {
       }
       this.db
         .prepare(`
-          INSERT INTO guest_threads (thread_id, open_id, title, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?)
+          INSERT INTO guest_threads (thread_id, open_id, title, desktop_managed, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
         `)
-        .run(threadId, openId, title, now, now);
+        .run(threadId, openId, title, desktopManaged ? 1 : 0, now, now);
       this.db
         .prepare("INSERT INTO guest_user_threads (open_id, thread_id) VALUES (?, ?)")
         .run(openId, threadId);
       this.db.exec("COMMIT");
-      return { threadId, openId, title, createdAt: now, updatedAt: now };
+      return { threadId, openId, title, desktopManaged, createdAt: now, updatedAt: now };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  bindNewGuestThread(openId: string, threadId: string, title: string, desktopManaged = false): GuestThread {
+    const now = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(`
+          INSERT INTO guest_threads (thread_id, open_id, title, desktop_managed, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(threadId, openId, title, desktopManaged ? 1 : 0, now, now);
+      this.db
+        .prepare(`
+          INSERT INTO guest_user_threads (open_id, thread_id)
+          VALUES (?, ?)
+          ON CONFLICT(open_id) DO UPDATE SET thread_id = excluded.thread_id
+        `)
+        .run(openId, threadId);
+      this.db.exec("COMMIT");
+      return { threadId, openId, title, desktopManaged, createdAt: now, updatedAt: now };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -188,17 +219,60 @@ export class StateStore {
   getGuestThreadForUser(openId: string): GuestThread | null {
     const row = this.db
       .prepare(`
-        SELECT thread.thread_id, thread.open_id, thread.title, thread.created_at, thread.updated_at
+        SELECT thread.thread_id, thread.open_id, thread.title, thread.desktop_managed,
+               thread.created_at, thread.updated_at
         FROM guest_user_threads AS binding
         JOIN guest_threads AS thread ON thread.thread_id = binding.thread_id
         WHERE binding.open_id = ?
       `)
       .get(openId) as
-      | { thread_id: string; open_id: string; title: string; created_at: number; updated_at: number }
+      | {
+          thread_id: string;
+          open_id: string;
+          title: string;
+          desktop_managed: number;
+          created_at: number;
+          updated_at: number;
+        }
       | undefined;
     return row
-      ? { threadId: row.thread_id, openId: row.open_id, title: row.title, createdAt: row.created_at, updatedAt: row.updated_at }
+      ? guestThreadFromRow(row)
       : null;
+  }
+
+  replaceGuestThread(oldThreadId: string, newThreadId: string, desktopManaged = true): GuestThread {
+    const existing = this.getGuestThread(oldThreadId);
+    if (!existing) throw new Error(`访客会话不存在：${oldThreadId}`);
+    const now = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(`
+          INSERT INTO guest_threads (thread_id, open_id, title, desktop_managed, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(newThreadId, existing.openId, existing.title, desktopManaged ? 1 : 0, existing.createdAt, now);
+      this.db
+        .prepare("UPDATE guest_user_threads SET thread_id = ? WHERE open_id = ? AND thread_id = ?")
+        .run(newThreadId, existing.openId, oldThreadId);
+      this.db
+        .prepare("UPDATE user_state SET active_thread_id = ?, updated_at = ? WHERE open_id = ? AND active_thread_id = ?")
+        .run(newThreadId, now, existing.openId, oldThreadId);
+      this.db
+        .prepare("UPDATE turn_routes SET thread_id = ?, updated_at = ? WHERE thread_id = ?")
+        .run(newThreadId, now, oldThreadId);
+      this.db.prepare("DELETE FROM guest_threads WHERE thread_id = ?").run(oldThreadId);
+      this.db.exec("COMMIT");
+      return {
+        ...existing,
+        threadId: newThreadId,
+        desktopManaged,
+        updatedAt: now,
+      };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   updateGuestThreadTitle(threadId: string, title: string): void {
@@ -209,21 +283,32 @@ export class StateStore {
     this.db.prepare("UPDATE guest_threads SET updated_at = ? WHERE thread_id = ?").run(Date.now(), threadId);
   }
 
+  setGuestThreadDesktopManaged(threadId: string, desktopManaged: boolean): void {
+    this.db
+      .prepare("UPDATE guest_threads SET desktop_managed = ?, updated_at = ? WHERE thread_id = ?")
+      .run(desktopManaged ? 1 : 0, Date.now(), threadId);
+  }
+
   getGuestThread(threadId: string): GuestThread | null {
     const row = this.db
-      .prepare("SELECT thread_id, open_id, title, created_at, updated_at FROM guest_threads WHERE thread_id = ?")
+      .prepare("SELECT thread_id, open_id, title, desktop_managed, created_at, updated_at FROM guest_threads WHERE thread_id = ?")
       .get(threadId) as
-      | { thread_id: string; open_id: string; title: string; created_at: number; updated_at: number }
+      | {
+          thread_id: string;
+          open_id: string;
+          title: string;
+          desktop_managed: number;
+          created_at: number;
+          updated_at: number;
+        }
       | undefined;
-    return row
-      ? { threadId: row.thread_id, openId: row.open_id, title: row.title, createdAt: row.created_at, updatedAt: row.updated_at }
-      : null;
+    return row ? guestThreadFromRow(row) : null;
   }
 
   listGuestThreads(openId: string, limit = 30): GuestThread[] {
     const rows = this.db
       .prepare(`
-        SELECT thread_id, open_id, title, created_at, updated_at
+        SELECT thread_id, open_id, title, desktop_managed, created_at, updated_at
         FROM guest_threads
         WHERE open_id = ?
         ORDER BY updated_at DESC
@@ -233,16 +318,50 @@ export class StateStore {
         thread_id: string;
         open_id: string;
         title: string;
+        desktop_managed: number;
         created_at: number;
         updated_at: number;
       }>;
-    return rows.map((row) => ({
-      threadId: row.thread_id,
-      openId: row.open_id,
-      title: row.title,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    return rows.map(guestThreadFromRow);
+  }
+
+  listGuestThreadsPendingDesktopMigration(limit = 100): GuestThread[] {
+    const rows = this.db
+      .prepare(`
+        SELECT thread_id, open_id, title, desktop_managed, created_at, updated_at
+        FROM guest_threads
+        WHERE desktop_managed = 0
+        ORDER BY created_at ASC
+        LIMIT ?
+      `)
+      .all(limit) as Array<{
+        thread_id: string;
+        open_id: string;
+        title: string;
+        desktop_managed: number;
+        created_at: number;
+        updated_at: number;
+      }>;
+    return rows.map(guestThreadFromRow);
+  }
+
+  listAllGuestThreads(limit = 100): GuestThread[] {
+    const rows = this.db
+      .prepare(`
+        SELECT thread_id, open_id, title, desktop_managed, created_at, updated_at
+        FROM guest_threads
+        ORDER BY created_at ASC
+        LIMIT ?
+      `)
+      .all(limit) as Array<{
+        thread_id: string;
+        open_id: string;
+        title: string;
+        desktop_managed: number;
+        created_at: number;
+        updated_at: number;
+      }>;
+    return rows.map(guestThreadFromRow);
   }
 
   getUser(openId: string): UserState | null {
@@ -299,4 +418,22 @@ export class StateStore {
     if (!row) return null;
     return { turnId: row.turn_id, openId: row.open_id, chatId: row.chat_id, role: row.role };
   }
+}
+
+function guestThreadFromRow(row: {
+  thread_id: string;
+  open_id: string;
+  title: string;
+  desktop_managed: number;
+  created_at: number;
+  updated_at: number;
+}): GuestThread {
+  return {
+    threadId: row.thread_id,
+    openId: row.open_id,
+    title: row.title,
+    desktopManaged: row.desktop_managed === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }

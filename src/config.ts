@@ -21,8 +21,12 @@ const schema = z.object({
   GUEST_WORKSPACE_ROOT: z.string().optional(),
   GUEST_CODEX_HOME: z.string().default("./data/guest-codex-home"),
   GUEST_DB_CONFIG_PATH: z.string().default(join(homedir(), ".config", "mc-ai", "connections.json")),
+  GUEST_DB_GATEWAY_PATH: z.string().optional(),
+  GUEST_PROJECT_INDEX_PATH: z.string().optional(),
   GUEST_DB_CONNECTION: z.string().default("production"),
   GUEST_MAX_CONCURRENT_TURNS: z.coerce.number().int().min(1).max(20).default(4),
+  GUEST_EXPORT_ROOT: z.string().default("./data/exports"),
+  GUEST_EXPORT_MAX_ROWS: z.coerce.number().int().min(1).max(1000).default(1000),
   STATE_DB_PATH: z.string().default("./data/state.db"),
   CODEX_BIN: z.string().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -39,8 +43,12 @@ export type AppConfig = {
   guestWorkspaceRoot?: string;
   guestCodexHome: string;
   guestDbConfigPath: string;
+  guestDbGatewayPath?: string;
+  guestProjectIndexPath?: string;
   guestDbConnection: string;
   guestMaxConcurrentTurns: number;
+  guestExportRoot?: string;
+  guestExportMaxRows?: number;
   stateDbPath: string;
   codexBin?: string;
   logLevel: "debug" | "info" | "warn" | "error";
@@ -61,6 +69,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (parsed.FEISHU_GUEST_MODE_ENABLED && !existsSync(resolve(parsed.GUEST_DB_CONFIG_PATH))) {
     throw new Error(`访客只读数据库配置不存在：${resolve(parsed.GUEST_DB_CONFIG_PATH)}`);
   }
+  if (parsed.FEISHU_GUEST_MODE_ENABLED && !parsed.GUEST_DB_GATEWAY_PATH) {
+    throw new Error("启用访客模式时必须配置 GUEST_DB_GATEWAY_PATH");
+  }
+  if (parsed.GUEST_DB_GATEWAY_PATH && !existsSync(resolve(parsed.GUEST_DB_GATEWAY_PATH))) {
+    throw new Error(`访客数据库网关不存在：${resolve(parsed.GUEST_DB_GATEWAY_PATH)}`);
+  }
 
   return {
     feishuAppId: parsed.FEISHU_APP_ID,
@@ -73,8 +87,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ...(guestWorkspaceRoot ? { guestWorkspaceRoot } : {}),
     guestCodexHome: resolve(parsed.GUEST_CODEX_HOME),
     guestDbConfigPath: resolve(parsed.GUEST_DB_CONFIG_PATH),
+    ...(parsed.GUEST_DB_GATEWAY_PATH ? { guestDbGatewayPath: realpathSync(resolve(parsed.GUEST_DB_GATEWAY_PATH)) } : {}),
+    ...(parsed.GUEST_PROJECT_INDEX_PATH ? { guestProjectIndexPath: resolve(parsed.GUEST_PROJECT_INDEX_PATH) } : {}),
     guestDbConnection: parsed.GUEST_DB_CONNECTION,
     guestMaxConcurrentTurns: parsed.GUEST_MAX_CONCURRENT_TURNS,
+    guestExportRoot: resolve(parsed.GUEST_EXPORT_ROOT),
+    guestExportMaxRows: parsed.GUEST_EXPORT_MAX_ROWS,
     stateDbPath: resolve(parsed.STATE_DB_PATH),
     ...(parsed.CODEX_BIN ? { codexBin: parsed.CODEX_BIN } : {}),
     logLevel: parsed.LOG_LEVEL,

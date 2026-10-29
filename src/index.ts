@@ -27,5 +27,6 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   const logger = new Logger("error");
   logger.error("服务启动失败", error instanceof Error ? { message: error.message, stack: error.stack } : error);
-  process.exitCode = 1;
+  // App Server/helper 子进程可能仍持有事件循环；显式退出后 LaunchAgent 的 KeepAlive 才能重启服务。
+  process.exit(1);
 });

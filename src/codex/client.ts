@@ -10,6 +10,7 @@ import type {
   CodexThread,
   JsonRpcId,
   ProjectListResponse,
+  CodexUserInput,
   ThreadListResponse,
   ThreadResponse,
   TurnStartResponse,
@@ -184,7 +185,12 @@ export class CodexClient extends EventEmitter {
     await this.rpc.request("thread/name/set", { threadId, name });
   }
 
-  async ensureReadOnlyThreadLoaded(threadId: string, cwd: string): Promise<void> {
+  async ensureReadOnlyThreadLoaded(
+    threadId: string,
+    cwd: string,
+    developerInstructions?: string,
+    dynamicTools?: DynamicToolSpec[],
+  ): Promise<void> {
     if (this.loadedThreads.has(threadId)) return;
     await this.rpc.request<ThreadResponse>("thread/resume", {
       threadId,
@@ -193,16 +199,29 @@ export class CodexClient extends EventEmitter {
       runtimeWorkspaceRoots: [cwd],
       approvalPolicy: "never",
       sandbox: "read-only",
+      ...(developerInstructions ? { developerInstructions } : {}),
+      ...(dynamicTools ? { dynamicTools } : {}),
       environments: [],
     });
     this.loadedThreads.add(threadId);
   }
 
-  async startReadOnlyTurn(threadId: string, cwd: string, text: string): Promise<string> {
-    await this.ensureReadOnlyThreadLoaded(threadId, cwd);
+  async startReadOnlyTurn(
+    threadId: string,
+    cwd: string,
+    text: string,
+    developerInstructions?: string,
+    dynamicTools?: DynamicToolSpec[],
+    imageDataUrls: string[] = [],
+  ): Promise<string> {
+    await this.ensureReadOnlyThreadLoaded(threadId, cwd, developerInstructions, dynamicTools);
+    const input: CodexUserInput[] = [
+      { type: "text", text, text_elements: [] },
+      ...imageDataUrls.map((url): CodexUserInput => ({ type: "image", url, detail: "high" })),
+    ];
     const response = await this.rpc.request<TurnStartResponse>("turn/start", {
       threadId,
-      input: [{ type: "text", text, text_elements: [] }],
+      input,
       approvalPolicy: "never",
       sandboxPolicy: { type: "readOnly", networkAccess: false },
       runtimeWorkspaceRoots: [cwd],
@@ -270,6 +289,16 @@ export class CodexClient extends EventEmitter {
 
   unarchiveThread(threadId: string): Promise<unknown> {
     return this.rpc.request("thread/unarchive", { threadId });
+  }
+
+  archiveThread(threadId: string): Promise<unknown> {
+    this.loadedThreads.delete(threadId);
+    return this.rpc.request("thread/archive", { threadId });
+  }
+
+  unsubscribeThread(threadId: string): Promise<unknown> {
+    this.loadedThreads.delete(threadId);
+    return this.rpc.request("thread/unsubscribe", { threadId });
   }
 
   resolveApproval(rpcId: JsonRpcId, decision: "accept" | "decline" | "cancel"): void {

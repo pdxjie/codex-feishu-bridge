@@ -3,7 +3,14 @@ import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { BridgeApp, isActiveWriterConflict, renderDesktopTurn, renderRolloutEvent, resolveAccessRole } from "../src/app.js";
+import {
+  BridgeApp,
+  isActiveWriterConflict,
+  renderDesktopTurn,
+  renderRolloutEvent,
+  resolveAccessRole,
+  resolveShortcutCommand,
+} from "../src/app.js";
 import { CodexClient } from "../src/codex/client.js";
 import { DesktopCodexClient, DesktopThreadUnavailableError } from "../src/codex/desktop-client.js";
 import type { CodexThread } from "../src/codex/types.js";
@@ -61,6 +68,38 @@ type TestAppInternals = {
   finishTurn: (params: Record<string, unknown>) => Promise<void>;
   onCodexNotification: (notification: { method: string; params?: Record<string, unknown> }) => void;
   flushLiveProgress: (state: unknown) => Promise<void>;
+};
+
+type GuestRecoveryInternals = {
+  config: AppConfig;
+  logger: Logger;
+  guestCodex: {
+    startReadOnlyTurn: (threadId: string, cwd: string, text: string) => Promise<string>;
+    createReadOnlyThread: (cwd: string) => Promise<CodexThread>;
+    setThreadName: (threadId: string, title: string) => Promise<void>;
+  };
+  guestTools: {
+    specs: () => [];
+    resolveUserAccess: (feishuUserId: string) => Promise<Record<string, unknown>>;
+    bindThreadAccess: (threadId: string, context: Record<string, unknown>) => void;
+  };
+  desktop: {
+    moveThreadToProject: (threadId: string, projectId: string) => Promise<void>;
+    refreshExternalThread: (threadId: string) => Promise<unknown>;
+  };
+  feishu: {
+    sendCard: () => Promise<string>;
+    getFeishuUserId: (openId: string) => Promise<string>;
+    getUserDisplayName?: (openId: string) => Promise<string>;
+  };
+  store: StateStore;
+  activeTurns: Map<string, string>;
+  liveProgress: Map<string, unknown>;
+  guestThreadInitializations: Map<string, Promise<unknown>>;
+  guestProjectId: string;
+  guestDesktopProjectId: string;
+  submitGuestPrompt: (openId: string, chatId: string, text: string) => Promise<void>;
+  createNewGuestThread: (openId: string, chatId: string) => Promise<void>;
 };
 
 function thread(id: string, projectId = "project-1"): CodexThread {
@@ -175,6 +214,14 @@ test("管理员保留完整角色，其他用户在开启后自动进入访客�
   assert.equal(resolveAccessRole("ou_colleague", owners, false), null);
 });
 
+test("只把独立的 /new 和 /stop 识别为飞书快捷指令", () => {
+  assert.equal(resolveShortcutCommand("/new"), "new");
+  assert.equal(resolveShortcutCommand("  /STOP  "), "stop");
+  assert.equal(resolveShortcutCommand("/new /tmp"), null);
+  assert.equal(resolveShortcutCommand("/newer"), null);
+  assert.equal(resolveShortcutCommand("普通消息"), null);
+});
+
 test("飞书消息直接写入 Desktop 的同一会话，不创建分支", async () => {
   const desktopCalls: Array<{ method: string; threadId: string; text?: string }> = [];
   const fixture = createTestApp({
@@ -267,6 +314,159 @@ test("只把 active writer 冲突识别为可自动分支错误", () => {
   assert.equal(isActiveWriterConflict(new Error("already has an active writer")), true);
   assert.equal(isActiveWriterConflict(new Error("permission denied")), false);
   assert.equal(isActiveWriterConflict("already has an active writer"), false);
+});
+
+test("访客会话被 Desktop 占用时自动更换只读执行线程", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-feishu-active-writer-"));
+  const store = new StateStore(join(directory, "state.db"));
+  store.addGuestThread("ou_guest", "thread-locked", "自主排查@张三", true);
+  const calls: string[] = [];
+  const app = Object.create(BridgeApp.prototype) as GuestRecoveryInternals;
+  app.config = {
+    feishuAppId: "test-app",
+    feishuAppSecret: "test-secret",
+    allowedOpenIds: new Set(),
+    guestModeEnabled: true,
+    allowedWorkspaceRoots: [directory],
+    defaultWorkspace: directory,
+    guestWorkspaceRoot: directory,
+    guestCodexHome: join(directory, "guest-home"),
+    guestDbConfigPath: join(directory, "connections.json"),
+    guestDbConnection: "production",
+    guestMaxConcurrentTurns: 4,
+    stateDbPath: join(directory, "state.db"),
+    logLevel: "error",
+  };
+  app.logger = logger;
+  app.store = store;
+  app.activeTurns = new Map();
+  app.liveProgress = new Map();
+  app.guestThreadInitializations = new Map();
+  app.guestProjectId = "guest-project";
+  app.guestDesktopProjectId = "desktop-project";
+  app.guestTools = {
+    specs: () => [],
+    async resolveUserAccess() { return {}; },
+    bindThreadAccess() {},
+  };
+  app.guestCodex = {
+    async startReadOnlyTurn(threadId) {
+      calls.push(`start:${threadId}`);
+      if (threadId === "thread-locked") throw new Error(`thread ${threadId} already has an active writer`);
+      return "turn-new";
+    },
+    async createReadOnlyThread() {
+      calls.push("create");
+      return thread("thread-new", "guest-project");
+    },
+    async setThreadName(threadId) {
+      calls.push(`name:${threadId}`);
+    },
+  };
+  app.desktop = {
+    async moveThreadToProject(threadId) {
+      calls.push(`move:${threadId}`);
+    },
+    async refreshExternalThread(threadId) {
+      calls.push(`refresh:${threadId}`);
+      return { schemaVersion: 1, thread: { id: threadId, kind: "codex" }, turns: [] };
+    },
+  };
+  app.feishu = {
+    async sendCard() { return "message-1"; },
+    async getFeishuUserId() { return "feishu-user"; },
+  };
+
+  try {
+    await app.submitGuestPrompt("ou_guest", "oc_guest", "查询采购单");
+    assert.deepEqual(calls, [
+      "start:thread-locked",
+      "create",
+      "name:thread-new",
+      "move:thread-new",
+      "start:thread-new",
+      "refresh:thread-new",
+    ]);
+    assert.equal(store.getGuestThreadForUser("ou_guest")?.threadId, "thread-new");
+    assert.equal(app.activeTurns.get("thread-new"), "turn-new");
+    assert.equal(app.activeTurns.has("thread-locked"), false);
+  } finally {
+    store.close();
+  }
+});
+
+test("访客 /new 新建只读会话并切换当前绑定", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-feishu-guest-shortcut-new-"));
+  const store = new StateStore(join(directory, "state.db"));
+  store.addGuestThread("ou_guest", "thread-old", "自主排查@张三", true);
+  const calls: string[] = [];
+  const app = Object.create(BridgeApp.prototype) as GuestRecoveryInternals;
+  app.config = {
+    feishuAppId: "test-app",
+    feishuAppSecret: "test-secret",
+    allowedOpenIds: new Set(),
+    guestModeEnabled: true,
+    allowedWorkspaceRoots: [directory],
+    defaultWorkspace: directory,
+    guestWorkspaceRoot: directory,
+    guestCodexHome: join(directory, "guest-home"),
+    guestDbConfigPath: join(directory, "connections.json"),
+    guestDbConnection: "production",
+    guestMaxConcurrentTurns: 4,
+    stateDbPath: join(directory, "state.db"),
+    logLevel: "error",
+  };
+  app.logger = logger;
+  app.store = store;
+  app.activeTurns = new Map();
+  app.liveProgress = new Map();
+  app.guestThreadInitializations = new Map();
+  app.guestProjectId = "guest-project";
+  app.guestDesktopProjectId = "desktop-project";
+  app.guestTools = {
+    specs: () => [],
+    async resolveUserAccess() { return {}; },
+    bindThreadAccess() {},
+  };
+  app.guestCodex = {
+    async startReadOnlyTurn() { return "unused"; },
+    async createReadOnlyThread() {
+      calls.push("create");
+      return thread("thread-new", "guest-project");
+    },
+    async setThreadName(threadId, title) {
+      calls.push(`name:${threadId}:${title}`);
+    },
+  };
+  app.desktop = {
+    async moveThreadToProject(threadId, projectId) {
+      calls.push(`move:${threadId}:${projectId}`);
+    },
+    async refreshExternalThread() { return {}; },
+  };
+  app.feishu = {
+    async sendCard() {
+      calls.push("card");
+      return "message-1";
+    },
+    async getFeishuUserId() { return "feishu-user"; },
+    async getUserDisplayName() { return "张三"; },
+  };
+
+  try {
+    await app.createNewGuestThread("ou_guest", "oc_guest");
+    assert.deepEqual(calls, [
+      "create",
+      "name:thread-new:自主排查@张三",
+      "move:thread-new:desktop-project",
+      "card",
+    ]);
+    assert.equal(store.getGuestThreadForUser("ou_guest")?.threadId, "thread-new");
+    assert.equal(store.getGuestThread("thread-old")?.openId, "ou_guest");
+    assert.equal(store.getUser("ou_guest")?.activeThreadId, "thread-new");
+  } finally {
+    store.close();
+  }
 });
 
 test("任务结束后自动推送带会话标题的结果", async () => {
@@ -420,6 +620,31 @@ test("向会话发消息前先确保 Desktop 已经加载", async () => {
   ]);
 });
 
+test("移动 Codex 会话到 Desktop 项目时不传错误的 source 参数", async () => {
+  const calls: Array<{ caller: string; tool: string; args: Record<string, unknown> }> = [];
+  const client = new DesktopCodexClient(logger) as unknown as {
+    resolveControllerThread: (threadId: string) => Promise<string>;
+    callTool: (caller: string, tool: string, args: Record<string, unknown>) => Promise<{
+      success: boolean;
+      contentItems: [];
+    }>;
+    moveThreadToProject: (threadId: string, projectId: string) => Promise<void>;
+  };
+  client.resolveControllerThread = async () => "controller-thread";
+  client.callTool = async (caller, tool, args) => {
+    calls.push({ caller, tool, args });
+    return { success: true, contentItems: [] };
+  };
+
+  await client.moveThreadToProject("guest-thread", "desktop-project");
+
+  assert.deepEqual(calls, [{
+    caller: "controller-thread",
+    tool: "move_thread_to_project",
+    args: { threadId: "guest-thread", projectId: "desktop-project" },
+  }]);
+});
+
 test("分支会话继承项目归属并设置并行名称", async () => {
   const requests: Array<{ method: string; params: unknown }> = [];
   const client = new CodexClient("/bin/true", logger);
@@ -473,6 +698,7 @@ test("受限访客线程固定归属自主排查项目并保持只读参数", as
         return { project: { id: "guest-project", name: "自主排查", roots: [{ path: "/guest/mc" }] } };
       }
       if (method === "thread/start") return { thread: thread("guest-thread", "guest-project") };
+      if (method === "turn/start") return { turn: { id: "guest-turn", status: "inProgress", items: [] } };
       return {};
     },
   };
@@ -487,6 +713,15 @@ test("受限访客线程固定归属自主排查项目并保持只读参数", as
     project.id,
   );
   await client.setThreadName(created.id, "自主排查@张三");
+  const turnId = await client.startReadOnlyTurn(
+    created.id,
+    "/guest/mc",
+    "分析截图",
+    "readonly",
+    [],
+    ["data:image/png;base64,iVBORw0KGgo="],
+  );
+  assert.equal(turnId, "guest-turn");
 
   assert.deepEqual(requests, [
     {
@@ -515,6 +750,21 @@ test("受限访客线程固定归属自主排查项目并保持只读参数", as
     {
       method: "thread/name/set",
       params: { threadId: "guest-thread", name: "自主排查@张三" },
+    },
+    {
+      method: "turn/start",
+      params: {
+        threadId: "guest-thread",
+        input: [
+          { type: "text", text: "分析截图", text_elements: [] },
+          { type: "image", url: "data:image/png;base64,iVBORw0KGgo=", detail: "high" },
+        ],
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+        runtimeWorkspaceRoots: ["/guest/mc"],
+        environments: [],
+        turnTrigger: "feishu_guest",
+      },
     },
   ]);
 });

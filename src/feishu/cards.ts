@@ -189,8 +189,11 @@ export function guestHelpCard(): Card {
     "ERP 只读排查助手",
     [
       markdown(
-        "请直接发送线上问题、订单号、报错信息或业务现象。机器人会自动在“自主排查”项目中使用你的固定专属会话，并结合指定 ERP 项目源码与生产只读数据分析原因。\n\n" +
-          "访客不提供项目、会话列表、切换或新建命令；你无法查看管理员或其他同事的会话，也不能修改源码或线上数据。",
+        "请直接发送线上问题、订单号、报错信息或业务现象。机器人会自动在“自主排查”项目中使用你的专属会话，并结合指定 ERP 项目源码与生产只读数据分析原因。\n\n" +
+          "**快捷指令**\n" +
+          "- `/new`：新建并切换到一个只读排查会话\n" +
+          "- `/stop`：停止当前会话正在执行的任务\n\n" +
+          "访客不提供项目、会话列表或任意切换入口；你无法查看管理员或其他同事的会话，也不能修改源码或线上数据。",
       ),
     ],
     "wathet",
@@ -274,9 +277,10 @@ export function parallelForkCard(originalThreadId: string, forkThreadId: string)
 }
 
 export function resultCard(title: string, content: string, failed = false): Card {
+  const result = truncate(content || "任务已结束，但没有返回文本结果。", 12_000);
   return card(
     title,
-    [markdown(truncate(content || "任务已结束，但没有返回文本结果。", 12_000))],
+    renderMarkdownElements(result),
     failed ? "red" : "green",
   );
 }
@@ -287,9 +291,150 @@ export function threadResultCard(threadTitle: string, content: string, failed = 
   const result = truncate(content || "任务已结束，但没有返回文本结果。", 12_000);
   return card(
     `【${safeTitle}】${status}`,
-    [markdown(`**会话：${escapeMarkdown(safeTitle)}**\n\n${result}`)],
+    [markdown(`**会话：${escapeMarkdown(safeTitle)}**`), { tag: "hr" }, ...renderMarkdownElements(result)],
     failed ? "red" : "green",
   );
+}
+
+export function renderMarkdownElements(content: string): Record<string, unknown>[] {
+  const lines = content.replace(/\r\n?/g, "\n").split("\n");
+  const elements: Record<string, unknown>[] = [];
+  const text: string[] = [];
+
+  const flushText = (): void => {
+    const value = normalizeMarkdownBlock(text.splice(0).join("\n").trim());
+    if (!value) return;
+    for (const chunk of splitMarkdownChunks(value, 3_500)) elements.push(markdown(chunk));
+  };
+
+  for (let index = 0; index < lines.length; ) {
+    const header = parseTableRow(lines[index] ?? "");
+    const separator = lines[index + 1];
+    if (header && separator !== undefined && isTableSeparator(separator, header.length)) {
+      flushText();
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length) {
+        const row = parseTableRow(lines[index] ?? "");
+        if (!row) break;
+        rows.push(normalizeTableWidth(row, header.length));
+        index += 1;
+      }
+      elements.push(...renderTable(header, rows));
+      continue;
+    }
+    text.push(lines[index] ?? "");
+    index += 1;
+  }
+  flushText();
+
+  const compact = elements.filter((element, index) => {
+    if (element.tag !== "hr") return true;
+    return index > 0 && index + 1 < elements.length && elements[index - 1]?.tag !== "hr";
+  });
+  if (compact.length <= 45) return compact.length > 0 ? compact : [markdown("任务已结束，但没有返回文本结果。")];
+  return [...compact.slice(0, 44), markdown("…结果较长，飞书卡片仅展示前面的内容。请继续追问以查看剩余数据。")];
+}
+
+function renderTable(headers: string[], rows: string[][]): Record<string, unknown>[] {
+  const elements: Record<string, unknown>[] = [markdown(`**📋 查询明细（${rows.length} 条）**`)];
+  const visibleRows = rows.slice(0, 20);
+  for (const [index, row] of visibleRows.entries()) {
+    const primary = row[0]?.trim() || `第 ${index + 1} 条`;
+    const details = headers
+      .slice(1)
+      .map((header, column) => {
+        const value = row[column + 1]?.trim() || "—";
+        return `**${escapeMarkdown(stripInlineMarkdown(header))}：** ${value}`;
+      })
+      .join("\n");
+    elements.push(markdown(`**${escapeMarkdown(stripInlineMarkdown(headers[0] || "记录"))}：${primary}**${details ? `\n${details}` : ""}`));
+    if (index + 1 < visibleRows.length) elements.push({ tag: "hr" });
+  }
+  if (rows.length > visibleRows.length) {
+    elements.push(markdown(`_表格共 ${rows.length} 条，当前卡片展示前 ${visibleRows.length} 条。_`));
+  }
+  return elements;
+}
+
+function parseTableRow(line: string): string[] | null {
+  const normalized = line.trim().replace(/\\\|/g, "|");
+  if (!normalized.includes("|")) return null;
+  const body = normalized.replace(/^\|/, "").replace(/\|$/, "");
+  const cells = splitTableCells(body).map((cell) => cell.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+function splitTableCells(line: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let escaped = false;
+  for (const character of line) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+      current += character;
+    } else if (character === "|") {
+      cells.push(current);
+      current = "";
+    } else {
+      current += character;
+    }
+  }
+  cells.push(current);
+  return cells;
+}
+
+function isTableSeparator(line: string, columns: number): boolean {
+  const cells = parseTableRow(line);
+  return Boolean(cells && cells.length === columns && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim())));
+}
+
+function normalizeTableWidth(row: string[], columns: number): string[] {
+  if (row.length === columns) return row;
+  if (row.length < columns) return [...row, ...Array.from({ length: columns - row.length }, () => "")];
+  return [...row.slice(0, columns - 1), row.slice(columns - 1).join(" | ")];
+}
+
+function normalizeMarkdownBlock(content: string): string {
+  return content
+    .split("\n")
+    .map((line) => {
+      const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+      return heading ? `**${heading[1]}**` : line;
+    })
+    .join("\n");
+}
+
+function splitMarkdownChunks(content: string, limit: number): string[] {
+  if (content.length <= limit) return [content];
+  const paragraphs = content.split(/\n{2,}/);
+  const chunks: string[] = [];
+  let current = "";
+  for (const paragraph of paragraphs) {
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (candidate.length <= limit) {
+      current = candidate;
+      continue;
+    }
+    if (current) chunks.push(current);
+    if (paragraph.length <= limit) {
+      current = paragraph;
+      continue;
+    }
+    for (let offset = 0; offset < paragraph.length; offset += limit) {
+      chunks.push(paragraph.slice(offset, offset + limit));
+    }
+    current = "";
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function stripInlineMarkdown(value: string): string {
+  return value.replace(/^\*\*(.*?)\*\*$/, "$1").replace(/^`(.*?)`$/, "$1").trim();
 }
 
 export function approvalCard(approvalId: string, request: ApprovalRequest): Card {
@@ -347,6 +492,7 @@ export function helpCard(): Card {
           "- `/codex new`：准备在当前项目中新建会话，下一条消息作为首条任务\n" +
           "- `/codex new <绝对目录>`：准备在已登记的 Desktop 项目中新建会话\n" +
           "- `/codex stop`：停止当前任务\n" +
+          "- `/new`、`/stop`：上述新建和停止功能的快捷指令\n" +
           "- `/codex help`：查看帮助",
       ),
     ],

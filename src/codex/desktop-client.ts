@@ -109,6 +109,7 @@ export class DesktopCodexClient {
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private controllerThreadId: string | null = null;
+  private reconnecting: Promise<void> | null = null;
 
   constructor(private readonly logger: Logger) {}
 
@@ -173,6 +174,12 @@ export class DesktopCodexClient {
     return this.readThreadRaw(threadId, turnLimit);
   }
 
+  async refreshExternalThread(threadId: string, turnLimit = 3): Promise<DesktopThreadSnapshot> {
+    // 通过 Desktop 自己的工具读取一次，共享 App Server 新建的会话便会进入 Desktop 的实时索引。
+    // 与 readThread 不同，这里失败时不通过深链强制切换用户当前正在看的页面。
+    return this.readThreadRaw(threadId, turnLimit);
+  }
+
   async ensureThreadLoaded(threadId: string): Promise<void> {
     try {
       await this.readThreadRaw(threadId, 1);
@@ -216,6 +223,19 @@ export class DesktopCodexClient {
         environment: { type: "local" },
       },
     });
+  }
+
+  async moveThreadToProject(threadId: string, projectId: string): Promise<void> {
+    const callerThreadId = await this.resolveControllerThread(threadId);
+    await this.callTool(callerThreadId, "move_thread_to_project", {
+      threadId,
+      projectId,
+    });
+  }
+
+  async setThreadTitle(threadId: string, title: string): Promise<void> {
+    const callerThreadId = await this.resolveControllerThread(threadId);
+    await this.callTool(callerThreadId, "set_thread_title", { threadId, title });
   }
 
   async hasLocalRollout(threadId: string): Promise<boolean> {
@@ -344,6 +364,7 @@ export class DesktopCodexClient {
     tool: string,
     args: Record<string, unknown>,
   ): Promise<ToolResult> {
+    await this.ensureHelperConnected();
     const result = await this.request<ToolResult>({
       method: "call",
       tool,
@@ -358,6 +379,20 @@ export class DesktopCodexClient {
       throw new Error(message || `Codex Desktop 工具 ${tool} 执行失败。`);
     }
     return result;
+  }
+
+  private async ensureHelperConnected(): Promise<void> {
+    const childConnected = Boolean(this.child?.stdin && !this.child.stdin.destroyed);
+    const daemonConnected = Boolean(this.bridgeSocket && !this.bridgeSocket.destroyed);
+    if (childConnected || daemonConnected) return;
+    if (!this.reconnecting) {
+      this.controllerThreadId = null;
+      this.desktopPipePath = null;
+      this.reconnecting = this.start().finally(() => {
+        this.reconnecting = null;
+      });
+    }
+    await this.reconnecting;
   }
 
   private async startHelper(socketPath: string): Promise<void> {

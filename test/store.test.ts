@@ -42,6 +42,7 @@ test("每个访客固定绑定唯一会话并记录访客任务路由", () => {
     const duplicate = store.addGuestThread("ou_a", "guest-thread-a-duplicate", "自主排查@A");
     store.addGuestThread("ou_b", "guest-thread-b", "B 的排查");
     assert.equal(first.threadId, "guest-thread-a");
+    assert.equal(first.desktopManaged, false);
     assert.equal(duplicate.threadId, "guest-thread-a");
     assert.equal(store.getGuestThreadForUser("ou_a")?.threadId, "guest-thread-a");
     assert.deepEqual(store.listGuestThreads("ou_a").map((thread) => thread.threadId), ["guest-thread-a"]);
@@ -54,6 +55,51 @@ test("每个访客固定绑定唯一会话并记录访客任务路由", () => {
       chatId: "oc_a",
       role: "guest",
     });
+  } finally {
+    store.close();
+  }
+});
+
+test("访客会话可迁移为 Desktop 原生会话并保留固定绑定", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-feishu-guest-migration-"));
+  const store = new StateStore(join(directory, "state.db"));
+  try {
+    store.rememberUser("ou_a", "oc_a");
+    store.addGuestThread("ou_a", "external-thread", "自主排查@A");
+    store.setActiveThread("ou_a", "oc_a", "external-thread", "guest-project");
+    store.setTurnRoute("external-thread", "turn-1", "ou_a", "oc_a", "guest");
+
+    assert.deepEqual(
+      store.listGuestThreadsPendingDesktopMigration().map((thread) => thread.threadId),
+      ["external-thread"],
+    );
+    const migrated = store.replaceGuestThread("external-thread", "desktop-thread", true);
+
+    assert.equal(migrated.desktopManaged, true);
+    assert.equal(store.getGuestThreadForUser("ou_a")?.threadId, "desktop-thread");
+    assert.equal(store.getUser("ou_a")?.activeThreadId, "desktop-thread");
+    assert.equal(store.getTurnRoute("desktop-thread")?.turnId, "turn-1");
+    assert.equal(store.getGuestThread("external-thread"), null);
+    assert.deepEqual(store.listGuestThreadsPendingDesktopMigration(), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("访客新建会话时切换当前绑定并保留历史会话归属", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-feishu-guest-new-thread-"));
+  const store = new StateStore(join(directory, "state.db"));
+  try {
+    store.addGuestThread("ou_a", "guest-thread-old", "自主排查@A", true);
+    const created = store.bindNewGuestThread("ou_a", "guest-thread-new", "自主排查@A", true);
+
+    assert.equal(created.threadId, "guest-thread-new");
+    assert.equal(store.getGuestThreadForUser("ou_a")?.threadId, "guest-thread-new");
+    assert.equal(store.getGuestThread("guest-thread-old")?.openId, "ou_a");
+    assert.deepEqual(
+      store.listGuestThreads("ou_a").map((thread) => thread.threadId).sort(),
+      ["guest-thread-new", "guest-thread-old"],
+    );
   } finally {
     store.close();
   }
