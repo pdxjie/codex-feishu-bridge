@@ -281,12 +281,16 @@ export class BridgeApp {
   private ensureGuestThread(openId: string, chatId: string): Promise<GuestThread> {
     const existing = this.store.getGuestThreadForUser(openId);
     if (existing) {
-      this.store.setActiveThread(openId, chatId, existing.threadId, null);
-      return Promise.resolve(existing);
+      this.store.setActiveThread(openId, chatId, existing.threadId, this.guestProjectId);
+      const usesFallbackName = /^自主排查@同事-[A-Za-z0-9]{1,4}$/.test(existing.title);
+      if (existing.title.startsWith(`${GUEST_PROJECT_NAME}@`) && !usesFallbackName) return Promise.resolve(existing);
     }
     const pending = this.guestThreadInitializations.get(openId);
     if (pending) return pending;
-    const initialization = this.createGuestThread(openId, chatId).finally(() => {
+    const initialization = (existing
+      ? this.updateGuestThreadIdentity(existing, chatId)
+      : this.createGuestThread(openId, chatId)
+    ).finally(() => {
       this.guestThreadInitializations.delete(openId);
     });
     this.guestThreadInitializations.set(openId, initialization);
@@ -310,6 +314,16 @@ export class BridgeApp {
     const thread = this.store.addGuestThread(openId, created.id, title);
     this.store.setActiveThread(openId, chatId, thread.threadId, this.guestProjectId);
     return thread;
+  }
+
+  private async updateGuestThreadIdentity(thread: GuestThread, chatId: string): Promise<GuestThread> {
+    if (!this.guestCodex) throw new Error("访客只读执行器未启用。");
+    const displayName = await this.feishu.getUserDisplayName(thread.openId);
+    const title = truncateText(`${GUEST_PROJECT_NAME}@${displayName}`, 60);
+    await this.guestCodex.setThreadName(thread.threadId, title);
+    this.store.updateGuestThreadTitle(thread.threadId, title);
+    this.store.setActiveThread(thread.openId, chatId, thread.threadId, this.guestProjectId);
+    return this.store.getGuestThread(thread.threadId) ?? { ...thread, title, updatedAt: Date.now() };
   }
 
   private async resolveGuestProject(): Promise<void> {

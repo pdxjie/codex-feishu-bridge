@@ -462,3 +462,59 @@ test("分支会话继承项目归属并设置并行名称", async () => {
     },
   ]);
 });
+
+test("受限访客线程固定归属自主排查项目并保持只读参数", async () => {
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const client = new CodexClient("/bin/true", logger);
+  const fakeRpc = {
+    async request(method: string, params: unknown) {
+      requests.push({ method, params });
+      if (method === "project/create") {
+        return { project: { id: "guest-project", name: "自主排查", roots: [{ path: "/guest/mc" }] } };
+      }
+      if (method === "thread/start") return { thread: thread("guest-thread", "guest-project") };
+      return {};
+    },
+  };
+  (client as unknown as { rpc: typeof fakeRpc }).rpc = fakeRpc;
+
+  const project = await client.createProject("自主排查", ["/guest/mc"], "fixed-key");
+  const created = await client.createReadOnlyThread(
+    "/guest/mc",
+    "readonly",
+    [],
+    false,
+    project.id,
+  );
+  await client.setThreadName(created.id, "自主排查@张三");
+
+  assert.deepEqual(requests, [
+    {
+      method: "project/create",
+      params: {
+        name: "自主排查",
+        roots: [{ path: "/guest/mc" }],
+        metadata: {},
+        idempotencyKey: "fixed-key",
+      },
+    },
+    {
+      method: "thread/start",
+      params: {
+        cwd: "/guest/mc",
+        projectId: "guest-project",
+        runtimeWorkspaceRoots: ["/guest/mc"],
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        developerInstructions: "readonly",
+        dynamicTools: [],
+        environments: [],
+        ephemeral: false,
+      },
+    },
+    {
+      method: "thread/name/set",
+      params: { threadId: "guest-thread", name: "自主排查@张三" },
+    },
+  ]);
+});

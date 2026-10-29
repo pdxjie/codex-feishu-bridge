@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -16,20 +16,13 @@ export function prepareGuestCodexRuntime(guestCodexHome: string): GuestCodexRunt
 
   mkdirSync(guestCodexHome, { recursive: true, mode: 0o700 });
   chmodSync(guestCodexHome, 0o700);
-  const minimalConfig = extractModelConfig(readFileSync(sourceConfigPath, "utf8"));
-  writeFileSync(join(guestCodexHome, "config.toml"), minimalConfig, { mode: 0o600 });
-  chmodSync(join(guestCodexHome, "config.toml"), 0o600);
-  copyFileSync(sourceAuthPath, join(guestCodexHome, "auth.json"));
-  chmodSync(join(guestCodexHome, "auth.json"), 0o600);
-
-  const auth = JSON.parse(readFileSync(sourceAuthPath, "utf8")) as Record<string, unknown>;
-  const apiKey = typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY : process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("管理员 Codex 凭据中没有可供隔离访客执行器使用的 API Key。");
+  const sourceConfig = readFileSync(sourceConfigPath, "utf8");
 
   return {
     args: [
       "app-server",
       "--stdio",
+      ...extractMcpServerNames(sourceConfig).flatMap((name) => ["-c", `mcp_servers.${name}.enabled=false`]),
       "--disable",
       "shell_tool",
       "--disable",
@@ -44,6 +37,10 @@ export function prepareGuestCodexRuntime(guestCodexHome: string): GuestCodexRunt
       "multi_agent",
       "--disable",
       "worktrees",
+      "--disable",
+      "remote_plugin",
+      "--disable",
+      "memories",
     ],
     env: {
       PATH: process.env.PATH,
@@ -53,46 +50,14 @@ export function prepareGuestCodexRuntime(guestCodexHome: string): GuestCodexRunt
       USER: process.env.USER,
       LOGNAME: process.env.LOGNAME,
       HOME: guestCodexHome,
-      CODEX_HOME: guestCodexHome,
-      OPENAI_API_KEY: apiKey,
+      // 共享管理员的线程/项目索引，访客会话才能实时显示在 Desktop 的“自主排查”项目下。
+      // 能力隔离由上面的禁用开关、空 environments、只读 sandbox 和动态工具白名单共同强制。
+      CODEX_HOME: sourceHome,
     },
   };
 }
 
-function extractModelConfig(source: string): string {
-  const lines = source.split(/\r?\n/);
-  const providerLine = lines.find((line) => /^\s*model_provider\s*=/.test(line));
-  const modelLine = lines.find((line) => /^\s*model\s*=/.test(line));
-  const effortLine = lines.find((line) => /^\s*model_reasoning_effort\s*=/.test(line));
-  if (!providerLine || !modelLine) throw new Error("管理员 Codex 配置缺少 model_provider 或 model。");
-  const provider = /model_provider\s*=\s*["']([^"']+)["']/.exec(providerLine)?.[1];
-  if (!provider) throw new Error("无法解析管理员 Codex model_provider。");
-
-  const sectionHeader = `[model_providers.${provider}]`;
-  const sectionIndex = lines.findIndex((line) => line.trim() === sectionHeader);
-  if (sectionIndex < 0) throw new Error(`管理员 Codex 配置缺少 ${sectionHeader}。`);
-  const section: string[] = [];
-  for (let index = sectionIndex; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    if (index > sectionIndex && /^\s*\[/.test(line)) break;
-    section.push(line);
-  }
-
-  return [
-    providerLine,
-    modelLine,
-    ...(effortLine ? [effortLine] : []),
-    "",
-    ...section,
-    "",
-    "[features]",
-    "shell_tool = false",
-    "apps = false",
-    "browser_use = false",
-    "computer_use = false",
-    "image_generation = false",
-    "multi_agent = false",
-    "worktrees = false",
-    "",
-  ].join("\n");
+function extractMcpServerNames(source: string): string[] {
+  const names = [...source.matchAll(/^\s*\[mcp_servers\.([A-Za-z0-9_-]+)\]\s*$/gm)].map((match) => match[1]!);
+  return [...new Set(names)];
 }
