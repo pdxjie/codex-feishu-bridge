@@ -3,6 +3,8 @@ import { existsSync } from "node:fs";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import sqlParserPackage from "node-sql-parser";
 import type { Logger } from "../logger.js";
+import { authorizationUnknown, hasInventoryCapability, INVENTORY_OPERATIONS_ROLES, INVENTORY_SOURCE_FILES, type ShopScopeGroup } from "./inventory-policy.js";
+import { annotatePageBinding, pageAliasIds, reservedPageTable, reviewedPageBinding } from "./page-data-bindings.js";
 
 const { Parser } = sqlParserPackage as unknown as { Parser: new () => SqlParser };
 
@@ -21,6 +23,8 @@ export type ErpDataScope = {
   shops: "ALL" | number[];
   shopMarketplaces: "ALL" | number[];
   categories: "ALL" | number[];
+  shopGroups?: ShopScopeGroup[];
+  categoryScopeConfigured?: boolean;
 };
 
 export type ErpAccessContext = {
@@ -30,6 +34,8 @@ export type ErpAccessContext = {
   roleIds: number[];
   roleNames: string[];
   superAdministrator: boolean;
+  inventoryOperationsRole?: boolean;
+  inventoryCaseSourceAccess?: boolean;
   moduleIds: number[];
   moduleNames: string[];
   purviewIds: number[];
@@ -44,6 +50,8 @@ export type ErpPageAccess = {
   menuUrl: string;
   permissionUrl: string;
   hasAccess: boolean;
+  dataSources?: string[];
+  dataAccessHint?: string;
 };
 
 export type GuestAccessGuard = {
@@ -199,6 +207,7 @@ export class ErpAccessControl implements GuestAccessGuard {
         this.databaseConnection,
         `SELECT
            GROUP_CONCAT(DISTINCT r.role_name ORDER BY r.id SEPARATOR '||') AS role_names,
+           MAX(CASE WHEN r.id IN (${INVENTORY_OPERATIONS_ROLES.join(",")}) THEN 1 ELSE 0 END) AS inventory_operations_role,
            GROUP_CONCAT(DISTINCT CASE WHEN p.type = 0 THEN p.module_id END ORDER BY p.module_id) AS module_ids,
            GROUP_CONCAT(DISTINCT CASE WHEN p.id IN (${[PURCHASE_INFO_VIEW, SUPPLIER_INFO_VIEW, SUPPLIER_INFO_EXPORT, PURCHASE_INFO_EXPORT].join(",")}) THEN p.id END ORDER BY p.id) AS sensitive_purview_ids
          FROM mc_role r
@@ -213,7 +222,9 @@ export class ErpAccessControl implements GuestAccessGuard {
     const purviewIds = superAdministrator
       ? [PURCHASE_INFO_VIEW, SUPPLIER_INFO_VIEW, SUPPLIER_INFO_EXPORT, PURCHASE_INFO_EXPORT]
       : parseIdList(metadataRows.sensitive_purview_ids);
-    const dataScope = await this.loadDataScope(gateway, roleIds);
+    const dataScope: ErpDataScope = superAdministrator
+      ? { platforms: "ALL", shops: "ALL", shopMarketplaces: "ALL", categories: "ALL", shopGroups: [{ platform: 0, shop: 0, marketplace: 0 }], categoryScopeConfigured: true }
+      : await this.loadDataScope(gateway, roleIds);
     const context: ErpAccessContext = {
       feishuUserId,
       erpUserId: Number(identity.erp_user_id),
@@ -221,6 +232,7 @@ export class ErpAccessControl implements GuestAccessGuard {
       roleIds,
       roleNames: String(metadataRows.role_names ?? "").split("||").map((name) => name.trim()).filter(Boolean),
       superAdministrator,
+      inventoryOperationsRole: Number(metadataRows.inventory_operations_role) === 1,
       moduleIds,
       moduleNames: moduleIds.map((id) => MODULE_NAMES[id]).filter((name): name is string => Boolean(name)),
       purviewIds,
@@ -257,16 +269,23 @@ export class ErpAccessControl implements GuestAccessGuard {
       roles: context.roleNames,
       accessibleModules: context.moduleNames,
       dataScope: scopeSummary(context.dataScope),
-      enforcement: "数据库查询和导出必须通过具体 ERP 页面权限校验；同模块的其他页面权限不能替代。无法安全判定时默认拒绝。",
+      businessCapabilities: hasInventoryCapability(context) ? [{
+        name: "inventory_diagnosis", tool: "inventory_diagnose",
+        directions: ["渠道库存", "渠道IO", "历史扣减订单追溯", "调拨", "订单占用", "仓储库存核对", "仓储IO汇总", "在途分配与释放"],
+        scope: "已有角色授予；渠道/国家来自已有店铺站点范围，订单明细另校验店铺站点。共享库存证据不含价格、客户资料或其他渠道全量数据。",
+      }] : [],
+      relatedDiagnosis: { tool: "inventory_case_open", basis: "库存原因排查可按已有品库存页面权限授权同品同国的关联证据，不要求运营角色或关联模块页面权限；直接查询其他模块仍校验目标页面。" },
+      enforcement: "直接查询已授权页面的数据不要求 inventory_diagnosis 能力；按页面 dataSources/dataAccessHint 取数。库存联合排查另走 inventory_diagnose。页面搜索未匹配不等于无权；已明确页面却缺少数据映射属于桥接适配问题，不要求用户截图或新增角色。只有业务方向本身不清楚时才请用户补充。",
     };
   }
 
   async findPages(context: ErpAccessContext, query: string): Promise<ErpPageAccess[]> {
     const keyword = query.trim();
-    if (!keyword || keyword.length > 80 || !/^[\p{L}\p{N}\s_\-/]+$/u.test(keyword)) {
-      throw new Error("页面关键词只能包含文字、数字、空格、下划线、斜杠或短横线。");
+    if (!keyword || keyword.length > 80 || !/^[\p{L}\p{N}\s_\-/()（）]+$/u.test(keyword)) {
+      throw new Error("页面关键词只能包含文字、数字、空格、括号、下划线、斜杠或短横线。");
     }
     const escaped = escapeSqlLiteral(keyword);
+    const aliasIds = pageAliasIds(keyword);
     const roleList = context.roleIds.join(",");
     const accessSql = context.superAdministrator
       ? "1"
@@ -288,14 +307,14 @@ export class ErpAccessControl implements GuestAccessGuard {
            AND (COALESCE(v.view_name, '') LIKE '%${escaped}%'
              OR p.purview_name LIKE '%${escaped}%'
              OR COALESCE(v.menu_url, '') LIKE '%${escaped}%'
-             OR p.url LIKE '%${escaped}%')
+             OR p.url LIKE '%${escaped}%'${aliasIds.length ? ` OR p.id IN (${aliasIds.join(",")})` : ""})
          ORDER BY CASE WHEN COALESCE(v.view_name, '') = '${escaped}' THEN 0 ELSE 1 END,
                   p.id
          LIMIT 20`,
         20,
       ),
     );
-    return rows.map(pageAccessFromRow).filter((page): page is ErpPageAccess => page !== null);
+    return rows.map(pageAccessFromRow).filter((page): page is ErpPageAccess => page !== null).map(annotatePageBinding);
   }
 
   async authorizePage(context: ErpAccessContext, pagePurviewId: number): Promise<ErpPageAccess> {
@@ -323,9 +342,9 @@ export class ErpAccessControl implements GuestAccessGuard {
       ),
     );
     const page = row ? pageAccessFromRow(row) : null;
-    if (!page) throw pageDenied("无法确认对应的 ERP 页面");
+    if (!page) throw authorizationUnknown("无法确认对应的 ERP 页面");
     if (!page.hasAccess) throw pageDenied(`当前 ERP 用户没有“${page.pageName}”页面权限`);
-    return page;
+    return annotatePageBinding(page);
   }
 
   async authorizeSql(
@@ -338,12 +357,14 @@ export class ErpAccessControl implements GuestAccessGuard {
     const parsed = this.parseSql(sql);
     if (parsed.hasWildcard) throw denied("禁止 SELECT *；必须只选择本次排查必需的字段");
     if (parsed.tables.length === 0) return;
+    const binding = reviewedPageBinding(page);
     const touchedModules = new Set<number>();
     for (const table of parsed.tables) {
       const allowed = this.authorizeTableForPage(page, table);
       for (const moduleId of allowed) touchedModules.add(moduleId);
     }
     for (const column of parsed.columns) {
+      if (binding && !binding.columns.has(column)) throw authorizationUnknown(`“${page.pageName}”尚未登记字段 ${column}，不能借页面授权读取其他业务字段`);
       if (BLOCKED_COLUMN.test(column)) throw denied("查询包含 ERP 明确保护的个人信息或凭据字段");
       if (PURCHASE_PRICE_COLUMN.test(column)) {
         const required = operation === "export" ? PURCHASE_INFO_EXPORT : PURCHASE_INFO_VIEW;
@@ -363,6 +384,7 @@ export class ErpAccessControl implements GuestAccessGuard {
   }
 
   canReadProjectFile(context: ErpAccessContext, relativePath: string): boolean {
+    if ((hasInventoryCapability(context) || context.inventoryCaseSourceAccess) && INVENTORY_SOURCE_FILES.has(normalizePath(relativePath))) return true;
     const modules = this.fileModules.get(normalizePath(relativePath));
     return Boolean(modules && [...modules].some((moduleId) => context.moduleIds.includes(moduleId)));
   }
@@ -370,17 +392,24 @@ export class ErpAccessControl implements GuestAccessGuard {
   canReadProjectPath(context: ErpAccessContext, relativePath: string): boolean {
     const normalized = normalizePath(relativePath).replace(/^\.\/?/, "").replace(/\/$/, "");
     if (!normalized) return true;
+    if ((hasInventoryCapability(context) || context.inventoryCaseSourceAccess) && [...INVENTORY_SOURCE_FILES].some((file) => file.startsWith(`${normalized}/`))) return true;
     return context.moduleIds.some((moduleId) => this.readablePrefixes.get(moduleId)?.has(normalized));
   }
 
   private authorizeTableForPage(page: ErpPageAccess, table: string): number[] {
     const normalized = normalizeTable(table);
+    const binding = reviewedPageBinding(page);
+    if (binding) {
+      if (!binding.tables.includes(normalized)) throw authorizationUnknown(`“${page.pageName}”与数据表 ${normalized} 的业务映射不匹配；页面授权不等于整个计划或仓储模块授权`);
+      return [page.moduleId];
+    }
+    if (reservedPageTable(normalized)) throw authorizationUnknown(`数据表 ${normalized} 需使用已核验的分渠道品库存页面授权（1104），不能借用其他页面`);
     const tableModules = [...(this.tableModules.get(normalized) ?? [])];
-    if (tableModules.length === 0) throw denied(`无法将数据表 ${normalized} 安全归属到 ERP 页面`);
+    if (tableModules.length === 0) throw authorizationUnknown(`无法将数据表 ${normalized} 安全归属到 ERP 页面`);
     const pageModules = pageModuleIds(page);
     const authorized = tableModules.filter((moduleId) => pageModules.has(moduleId));
     if (authorized.length === 0) {
-      throw pageDenied(`“${page.pageName}”页面无权访问数据表 ${normalized}`);
+      throw new Error(`暂无法确认数据授权范围：“${page.pageName}”页面与数据表 ${normalized} 的业务映射不匹配。页面权限已通过，这是桥接数据适配缺失，需要维护者核对真实调用链；不是用户缺少权限，不要求截图或重复补充已明确的业务方向。`);
     }
     return authorized;
   }
@@ -415,44 +444,57 @@ export class ErpAccessControl implements GuestAccessGuard {
       this.requireScope(parsed.where, "shop_marketplace_id", context.dataScope.shopMarketplaces, "店铺站点");
     }
     const appliesCategoryScope = [...modules].some((id) => CATEGORY_SCOPED_MODULES.has(id));
-    if (appliesCategoryScope) this.requireScope(parsed.where, "category_id", context.dataScope.categories, "品类");
+    if (appliesCategoryScope && context.dataScope.categoryScopeConfigured !== false) this.requireScope(parsed.where, "category_id", context.dataScope.categories, "品类");
   }
 
   private requireScope(where: unknown, column: string, scope: "ALL" | number[], label: string): void {
-    if (scope === "ALL" || scope.length === 0) return;
+    if (scope === "ALL") return;
+    if (scope.length === 0) throw authorizationUnknown(`没有可核验的${label}数据范围`);
     if (!conditionGuaranteesAllowed(where, column, new Set(scope))) {
       throw denied(`当前 ERP 角色仅可访问指定${label}，查询必须使用 ${column} 明确限制在本人数据范围内`);
     }
   }
 
   private async loadDataScope(gateway: DatabaseGatewayForAccess, roleIds: number[]): Promise<ErpDataScope> {
-    const scopes = rowsOf(
-      await gateway.query(
+    const scopeResult = await gateway.query(
         this.databaseConnection,
-        `SELECT scope_type,
-           GROUP_CONCAT(CONCAT(scope_level1, ':', scope_level2, ':', scope_level3, ':', scope_value) SEPARATOR ',') AS scope_values
-         FROM mc_role_data_scope
-         WHERE role_id IN (${roleIds.join(",")})
-         GROUP BY scope_type`,
-        10,
-      ),
-    );
-    const result: ErpDataScope = { platforms: [], shops: [], shopMarketplaces: [], categories: [] };
-    for (const row of scopes) {
-      const values = String(row.scope_values ?? "").split(",").map((entry) => entry.split(":").map(Number));
+        `SELECT scope_type, scope_level1, scope_level2, scope_level3, scope_value
+         FROM mc_role_data_scope WHERE role_id IN (${roleIds.join(",")})`,
+        10000,
+      );
+    if (isRecord(scopeResult) && scopeResult.truncated) throw authorizationUnknown("ERP 数据范围读取不完整");
+    const result: ErpDataScope = { platforms: [], shops: [], shopMarketplaces: [], categories: [], shopGroups: [], categoryScopeConfigured: false };
+    for (const row of rowsOf(scopeResult)) {
       if (row.scope_type === "shop_group") {
-        if (values.some(([platform]) => platform === 0)) {
-          result.platforms = result.shops = result.shopMarketplaces = "ALL";
-          continue;
+        if ([row.scope_level1, row.scope_level2, row.scope_level3].some((value) => value === null || value === "" || value === undefined)) {
+          throw authorizationUnknown("ERP 店铺授权记录缺少层级值");
         }
-        result.platforms = uniquePositive(values.map(([platform]) => platform));
-        result.shops = uniquePositive(values.map(([, shop]) => shop));
-        result.shopMarketplaces = uniquePositive(values.map(([, , marketplace]) => marketplace));
+        const [platform, shop, marketplace] = [row.scope_level1, row.scope_level2, row.scope_level3].map(Number);
+        if (![platform, shop, marketplace].every((id) => Number.isSafeInteger(id))) throw authorizationUnknown("ERP 店铺授权记录异常");
+        // ERP uses negative IDs for invalid selections, and 0 for all descendants.
+        if (platform! < 0 || (platform! > 0 && shop! < 0) || (platform! > 0 && shop! > 0 && marketplace! < 0)) continue;
+        result.shopGroups!.push({ platform: platform!, shop: platform === 0 ? 0 : shop!, marketplace: platform === 0 || shop === 0 ? 0 : marketplace! });
       } else if (row.scope_type === "category") {
-        result.categories = values.some(([, , , category]) => category === 0)
-          ? "ALL"
-          : uniquePositive(values.map(([, , , category]) => category));
+        result.categoryScopeConfigured = true;
+        if (row.scope_value === null || row.scope_value === "" || row.scope_value === undefined) throw authorizationUnknown("ERP 品类授权记录缺少值");
+        const category = Number(row.scope_value);
+        if (!Number.isSafeInteger(category)) throw authorizationUnknown("ERP 品类授权记录异常");
+        if (category === 0) result.categories = "ALL";
+        else if (category > 0 && result.categories !== "ALL") result.categories.push(category);
       }
+    }
+    if (result.shopGroups!.some((group) => group.platform === 0)) {
+      result.platforms = result.shops = result.shopMarketplaces = "ALL";
+    } else if (result.shopGroups!.length) {
+      result.platforms = uniquePositive(result.shopGroups!.map((group) => group.platform));
+      const conditions = result.shopGroups!.map((g) => `(s.platform_type = ${g.platform}${g.shop ? ` AND s.id = ${g.shop}${g.marketplace ? ` AND sm.id = ${g.marketplace}` : ""}` : ""})`).join(" OR ");
+      const expanded = await gateway.query(this.databaseConnection,
+        `SELECT s.id AS shop_id, sm.id AS marketplace_id FROM mc_shop s
+         LEFT JOIN mc_shop_marketplace sm ON sm.shop_id = s.id AND sm.is_del = 0
+         WHERE s.is_del = 0 AND (${conditions})`, 10000);
+      if (isRecord(expanded) && expanded.truncated) throw authorizationUnknown("ERP 店铺站点范围读取不完整");
+      result.shops = uniquePositive(rowsOf(expanded).map((row) => Number(row.shop_id)));
+      result.shopMarketplaces = uniquePositive(rowsOf(expanded).map((row) => Number(row.marketplace_id)));
     }
     return result;
   }
@@ -603,12 +645,12 @@ function positiveInteger(value: unknown): boolean {
 }
 
 function scopeSummary(scope: ErpDataScope): Record<string, string | number> {
-  const summarize = (value: "ALL" | number[]) => (value === "ALL" ? "全部" : value.length === 0 ? "ERP未配置限制" : `${value.length} 项`);
+  const summarize = (value: "ALL" | number[]) => (value === "ALL" ? "全部" : value.length === 0 ? "未确认授权范围" : `${value.length} 项`);
   return {
     platforms: summarize(scope.platforms),
     shops: summarize(scope.shops),
     shopMarketplaces: summarize(scope.shopMarketplaces),
-    categories: summarize(scope.categories),
+    categories: scope.categoryScopeConfigured === false ? "ERP未配置品类限制；仍按业务的店铺/渠道授权" : summarize(scope.categories),
   };
 }
 

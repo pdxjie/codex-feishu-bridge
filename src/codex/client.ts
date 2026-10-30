@@ -185,6 +185,10 @@ export class CodexClient extends EventEmitter {
     await this.rpc.request("thread/name/set", { threadId, name });
   }
 
+  async setThreadProject(threadId: string, projectId: string): Promise<void> {
+    await this.rpc.request("thread/metadata/update", { threadId, projectId });
+  }
+
   async ensureReadOnlyThreadLoaded(
     threadId: string,
     cwd: string,

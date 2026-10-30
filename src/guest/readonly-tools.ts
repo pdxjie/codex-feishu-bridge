@@ -12,6 +12,10 @@ import {
   type GuestAccessGuard,
 } from "./erp-access-control.js";
 import { GuestExportManager, type GuestExportFile, type GuestExportFormat } from "./export-files.js";
+import { compileInventoryQuery, INVENTORY_DATASETS } from "./inventory-diagnostics.js";
+import { InventoryCases } from "./inventory-case.js";
+import { NativeExportManager } from "./native-export.js";
+import type { NativeExportConfig } from "./native-export-protocol.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_TOOL_OUTPUT = 48_000;
@@ -39,6 +43,8 @@ export class GuestReadonlyTools {
   private readonly ripgrepPath: string;
   private readonly exports: GuestExportManager;
   private readonly access: GuestAccessGuard;
+  private readonly nativeExports: NativeExportManager;
+  private readonly inventoryCases: InventoryCases;
 
   constructor(
     projectRoot: string,
@@ -50,10 +56,12 @@ export class GuestReadonlyTools {
     private readonly exportMaxRows = 10_000,
     accessIndexPath?: string,
     accessGuard?: GuestAccessGuard,
+    nativeExportConfig?: NativeExportConfig,
   ) {
     this.projectRoot = realpathSync(projectRoot);
     this.ripgrepPath = resolveRipgrepBinary();
     this.exports = new GuestExportManager(exportRoot, exportMaxRows, logger);
+    this.nativeExports = new NativeExportManager(join(exportRoot, "native-jobs"), nativeExportConfig, logger);
     this.access =
       accessGuard ??
       new ErpAccessControl(
@@ -63,10 +71,11 @@ export class GuestReadonlyTools {
         this.databaseConnection,
         logger,
       );
+    this.inventoryCases = new InventoryCases(this.access, () => this.database(), this.databaseConnection);
   }
 
   async initialize(): Promise<void> {
-    await Promise.all([this.exports.initialize(), this.access.initialize()]);
+    await Promise.all([this.exports.initialize(), this.access.initialize(), this.nativeExports.initialize()]);
   }
 
   resolveUserAccess(feishuUserId: string): Promise<ErpAccessContext> {
@@ -77,20 +86,47 @@ export class GuestReadonlyTools {
     this.access.bindThread(threadId, context);
   }
 
-  takeExportFiles(turnId: string): GuestExportFile[] {
-    return this.exports.takeFiles(turnId);
+  bindGuestPrompt(threadId: string, context: ErpAccessContext, prompt: string, previousThreadId?: string): void {
+    this.inventoryCases.bindPrompt(threadId, context, prompt, previousThreadId);
   }
 
-  removeExportFiles(files: GuestExportFile[]): Promise<void> {
-    return this.exports.removeFiles(files);
+  takeExportFiles(turnId: string): GuestExportFile[] {
+    return [...this.exports.takeFiles(turnId), ...this.nativeExports.takeFiles(turnId)];
+  }
+
+  async removeExportFiles(files: GuestExportFile[]): Promise<void> {
+    await this.nativeExports.removeSentFiles(files);
+    await this.exports.removeFiles(files);
+  }
+
+  async authorizeExportDelivery(file: GuestExportFile): Promise<void> {
+    await this.nativeExports.authorizeDelivery(file);
   }
 
   specs(): DynamicToolSpec[] {
     return [
+      tool("erp_export_catalog", "查看已接入ERP原生导出的业务、筛选条件、字段与服务是否就绪。用户明确要求标准业务导出时先调用；未接入不代表ERP本身没有该功能。", {}),
+      tool("erp_native_export_file", "通过服务认证调用ERP原有导出逻辑，生成真实Excel并在结束后发送当前飞书聊天。无需用户登录。ERP校验本人页面、导出和数据权限。仅明确要求导出时使用；固定执行脚本，不接受URL、SQL、代码或身份。先从erp_export_catalog确认准确匹配。", {
+        kind: { type: "string", enum: ["channel_stock", "purchase_orders"] },
+        filters: { type: "object", additionalProperties: false, properties: {
+          sku: { type: "string" }, platformId: { type: "integer", minimum: 1 }, countryId: { type: "integer", minimum: 1 }, storehouseId: { type: "integer", minimum: 1 },
+          startDate: { type: "string" }, endDate: { type: "string" }, fields: { type: "array", items: { type: "string" } },
+        } },
+      }, ["kind", "filters"]),
       tool("erp_access_profile", "查看当前飞书用户映射到 ERP 后的角色、可访问模块与数据范围。首次排查应先调用。", {}),
-      tool("erp_page_access", "按页面名称或业务关键词查找 ERP 页面权限。查询或导出业务数据前必须先调用，并使用目标页面返回的 pagePurviewId；hasAccess=false 时必须直接回复权限不足。", {
+      tool("erp_page_access", "按关键词搜索页面候选。已登记页面返回dataSources和dataAccessHint：直接查询该页面无需库存联合诊断角色。只有目标页面匹配且hasAccess=false才判无权；已授权却映射失败是桥接适配问题，不能要求用户截图或开权限。库存联合排查另走inventory_diagnose。", {
         query: { type: "string", minLength: 1, maxLength: 80 },
       }, ["query"]),
+      tool("inventory_case_open", "库存异常或原因排查先用此工具：以有权限的分渠道/全渠道品库存页面1104/1103为业务依据，核验真实聊天问题、品编码和国家，返回品SKU映射、两页库存组成和更新时间，并授权该品该国的批次/IO/调拨/占用等关联证据。无需运营角色或仓储页面权限。直接索要无权模块数据不能使用。", {
+        pagePurviewId: pagePurviewIdSchema(), itemsCode: { type: "string" }, countryCode: { type: "string", description: "问题中的国家二字码，例如CA、US" },
+      }, ["pagePurviewId", "itemsCode", "countryCode"]),
+      tool("inventory_diagnose", "受控库存联合排查：已有运营角色按店铺范围，或inventory_case_open已核验的品/国家关系授权；不要求关联模块页面权限。支持渠道库存、IO、调拨、订单占用、仓储数量核对/IO汇总、在途分配。只接受业务过滤条件，不接受 SQL。明确 SKU 和渠道；历史数据必须给出日期，当前占用不按日期截断。平台 ID：亚马逊1、Wayfair3、Walmart6、eBay7、VC16、Walmart DSV17、Temu20、TikTok21；其他渠道先读 PlatformConstant。", inventoryProperties(), ["dataset", "sku"]),
+      tool("inventory_export_file", "仅用户明确要求导出时使用；导出与 inventory_diagnose 相同授权、字段与关联范围的排查证据，不允许导出任意模块或用户拼接的数据。机器人会在任务结束后发送文件。", {
+        ...inventoryProperties(this.exportMaxRows),
+        title: { type: "string", minLength: 1, maxLength: 120 },
+        fileName: { type: "string", minLength: 1, maxLength: 120 },
+        format: { type: "string", enum: ["xlsx", "csv", "docx"], default: "xlsx" },
+      }, ["dataset", "sku", "title", "fileName"]),
       tool("database_list_connections", "确认当前访客允许使用的只读数据库连接及环境。不会返回主机、账号或密码。", {}),
       tool("project_search", "在指定 ERP 项目源码内搜索文本或符号。只返回匹配文件和行号。", {
         query: { type: "string", minLength: 2, maxLength: 200 },
@@ -144,16 +180,61 @@ export class GuestReadonlyTools {
 
   async handle(call: DynamicToolCall): Promise<DynamicToolResult> {
     const args = isRecord(call.arguments) ? call.arguments : {};
-    const accessContext = await this.access.contextForThread(call.threadId);
+    const accessContext = { ...await this.access.contextForThread(call.threadId), inventoryCaseSourceAccess: false };
+    // Source-code exceptions are limited to reviewed files and recheck source permissions.
+    const relatedCase = await this.inventoryCases.current(call.threadId, accessContext);
+    if (relatedCase) accessContext.inventoryCaseSourceAccess = true;
     this.logger.info("访客只读工具调用", { threadId: call.threadId, turnId: call.turnId, tool: call.tool });
     let value: unknown;
     switch (call.tool) {
+      case "erp_export_catalog":
+        value = this.nativeExports.catalog();
+        break;
+      case "erp_native_export_file": {
+        const file = await this.nativeExports.create(call, accessContext, args);
+        value = { status: "created", source: "ERP原生导出", fileName: file.fileName, rowCount: file.rowCount,
+          message: "已取得ERP导出文件，任务结束后机器人发送到当前飞书聊天。" };
+        break;
+      }
       case "erp_access_profile":
-        value = this.access.publicProfile(accessContext);
+        value = { ...this.access.publicProfile(accessContext), activeRelatedDiagnosis: relatedCase ?? null };
         break;
-      case "erp_page_access":
-        value = await this.access.findPages(accessContext, requiredString(args.query, "query"));
+      case "erp_page_access": {
+        const candidates = await this.access.findPages(accessContext, requiredString(args.query, "query"));
+        value = {
+          status: candidates.length ? "candidates_require_business_match" : "authorization_scope_unconfirmed",
+          candidates,
+          message: "搜索结果是页面候选。匹配且hasAccess=true时按dataSources/dataAccessHint查询，不额外要求库存联合诊断角色；只有明确目标页面无权才拒绝。已授权页面的数据映射失败应由维护者处理，不能转为要求用户截图或补开权限。",
+        };
         break;
+      }
+      case "inventory_case_open":
+        value = await this.inventoryCases.open(call.threadId, accessContext, args);
+        break;
+      case "inventory_diagnose":
+      case "inventory_export_file": {
+        const exporting = call.tool === "inventory_export_file";
+        const maxRows = boundedInteger(args.maxRows, exporting ? this.exportMaxRows : 50, 1, exporting ? this.exportMaxRows : 100);
+        const query = compileInventoryQuery(accessContext, args, maxRows, relatedCase);
+        this.logger.info("库存联合排查授权", {
+          threadId: call.threadId, erpUserId: accessContext.erpUserId,
+          capability: relatedCase ? "inventory_related_case" : "inventory_diagnosis",
+          sourcePage: relatedCase?.pagePurviewId, itemsCode: relatedCase?.itemsCode, countryId: relatedCase?.countryId,
+          dataset: query.dataset, platformId: query.platformId, exporting,
+        });
+        const result = await (await this.database()).query(this.databaseConnection, query.sql, maxRows) as DatabaseQueryResult;
+        if (!exporting) {
+          value = { dataset: query.dataset, rows: result.rows, rowCount: result.rowCount, truncated: result.truncated, notes: query.notes };
+        } else {
+          const file = await this.exports.create({
+            turnId: call.turnId, title: requiredString(args.title, "title"),
+            fileName: requiredString(args.fileName, "fileName"), format: exportFormat(args.format), rows: recordRows(result.rows),
+          });
+          value = { status: "created", fileName: file.fileName, rowCount: file.rowCount, sourceTruncated: Boolean(result.truncated), notes: query.notes,
+            message: "排查证据文件已生成，任务结束后机器人发送到当前飞书聊天。" };
+        }
+        break;
+      }
       case "database_list_connections": {
         const gateway = await this.database();
         const profile = gateway.profile(this.databaseConnection);
@@ -432,6 +513,21 @@ function pagePurviewIdSchema(): Record<string, unknown> {
     type: "integer",
     minimum: 1,
     description: "目标 ERP 页面的页面权限 ID，必须来自本轮 erp_page_access 的精确匹配结果。",
+  };
+}
+
+function inventoryProperties(maxRows = 100): Record<string, unknown> {
+  return {
+    dataset: { type: "string", enum: INVENTORY_DATASETS, description: "stock 当前渠道库存；channel_io 历史渠道流水；channel_io_orders 按流水实际批次和推单时间追溯历史扣减订单，包含已发货订单，不能用occupancy代替；transfers 历史调拨；occupancy 当前本人可见订单占用；occupancy_summary 当前渠道占用数量汇总；warehouse_reconciliation 关联物理批次数量核对；warehouse_io_summary 关联物理批次流水汇总；transit_allocations 在途分配/释放。" },
+    sku: { type: "string", minLength: 1, maxLength: 64 },
+    ioRecordId: { type: "integer", minimum: 1, description: "仅channel_io/channel_io_orders使用，精确指定channel_io返回的流水id，追问某次扣减对应订单时必传。" },
+    platformId: { type: "integer", minimum: 1, description: "渠道常量 ID；用户只有一个授权平台时可省略。" },
+    countryId: { type: "integer", minimum: 1 },
+    storehouseId: { type: "integer", minimum: 1 },
+    orderId: { type: "string", description: "仅 occupancy 可用，精确匹配 ERP 订单编号。" },
+    startDate: { type: "string", description: "历史流水/调拨必填 YYYY-MM-DD，ERP记录时间口径。" },
+    endDate: { type: "string", description: "包含当天，跨度最多31天。当前库存/占用查询不按日期过滤。" },
+    maxRows: { type: "integer", minimum: 1, maximum: maxRows, default: Math.min(50, maxRows) },
   };
 }
 

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NODE_ENV</key>
+		<string>production</string>
+		<key>PATH</key>
+		<string>/Users/gaochenjie/.nvm/versions/node/v24.4.0/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.gaochenjie.codex-erp-export</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/gaochenjie/.nvm/versions/node/v24.4.0/bin/node</string>
+		<string>--import</string>
+		<string>tsx</string>
+		<string>/Users/gaochenjie/Desktop/codex-feishu-bridge/src/native-export-service.ts</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/gaochenjie/Desktop/codex-feishu-bridge/data/native-export.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/gaochenjie/Desktop/codex-feishu-bridge/data/native-export.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/gaochenjie/Desktop/codex-feishu-bridge</string>
+</dict>
+</plist>

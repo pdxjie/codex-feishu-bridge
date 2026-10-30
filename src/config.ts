@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
+import { validateEndpoint, type NativeExportConfig } from "./guest/native-export-protocol.js";
 
 const nonEmptyList = z.string().transform((value) =>
   value
@@ -13,7 +14,7 @@ const nonEmptyList = z.string().transform((value) =>
 const schema = z.object({
   FEISHU_APP_ID: z.string().min(1),
   FEISHU_APP_SECRET: z.string().min(1),
-  FEISHU_ALLOWED_OPEN_IDS: nonEmptyList.pipe(z.array(z.string()).min(1)),
+  FEISHU_ALLOWED_OPEN_IDS: nonEmptyList.optional().transform((value) => value ?? []),
   FEISHU_GUEST_MODE_ENABLED: z.string().default("false").transform((value) => value.toLowerCase() === "true"),
   FEISHU_TENANT_KEY: z.string().optional(),
   ALLOWED_WORKSPACE_ROOTS: nonEmptyList.pipe(z.array(z.string()).min(1)),
@@ -27,6 +28,8 @@ const schema = z.object({
   GUEST_MAX_CONCURRENT_TURNS: z.coerce.number().int().min(1).max(20).default(4),
   GUEST_EXPORT_ROOT: z.string().default("./data/exports"),
   GUEST_EXPORT_MAX_ROWS: z.coerce.number().int().min(1).max(10_000).default(10_000),
+  ERP_NATIVE_EXPORT_URL: z.string().optional(),
+  ERP_NATIVE_EXPORT_SECRET_FILE: z.string().optional(),
   STATE_DB_PATH: z.string().default("./data/state.db"),
   CODEX_BIN: z.string().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -49,6 +52,7 @@ export type AppConfig = {
   guestMaxConcurrentTurns: number;
   guestExportRoot?: string;
   guestExportMaxRows?: number;
+  nativeExport?: NativeExportConfig;
   stateDbPath: string;
   codexBin?: string;
   logLevel: "debug" | "info" | "warn" | "error";
@@ -56,6 +60,10 @@ export type AppConfig = {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = schema.parse(env);
+  if (!parsed.FEISHU_GUEST_MODE_ENABLED && parsed.FEISHU_ALLOWED_OPEN_IDS.length === 0) {
+    throw new Error("未启用游客模式时，必须配置 FEISHU_ALLOWED_OPEN_IDS 管理员列表。");
+  }
+  if (Boolean(parsed.ERP_NATIVE_EXPORT_URL) !== Boolean(parsed.ERP_NATIVE_EXPORT_SECRET_FILE)) throw new Error("ERP_NATIVE_EXPORT_URL 和 ERP_NATIVE_EXPORT_SECRET_FILE 必须同时配置。");
   const roots = parsed.ALLOWED_WORKSPACE_ROOTS.map(canonicalDirectory);
   const defaultWorkspace = canonicalDirectory(parsed.DEFAULT_WORKSPACE);
   const guestWorkspaceRoot = parsed.GUEST_WORKSPACE_ROOT ? canonicalDirectory(parsed.GUEST_WORKSPACE_ROOT) : undefined;
@@ -93,6 +101,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     guestMaxConcurrentTurns: parsed.GUEST_MAX_CONCURRENT_TURNS,
     guestExportRoot: resolve(parsed.GUEST_EXPORT_ROOT),
     guestExportMaxRows: parsed.GUEST_EXPORT_MAX_ROWS,
+    ...(parsed.ERP_NATIVE_EXPORT_URL && parsed.ERP_NATIVE_EXPORT_SECRET_FILE ? { nativeExport: {
+      endpoint: validateEndpoint(parsed.ERP_NATIVE_EXPORT_URL), secretFile: resolve(parsed.ERP_NATIVE_EXPORT_SECRET_FILE),
+    } } : {}),
     stateDbPath: resolve(parsed.STATE_DB_PATH),
     ...(parsed.CODEX_BIN ? { codexBin: parsed.CODEX_BIN } : {}),
     logLevel: parsed.LOG_LEVEL,

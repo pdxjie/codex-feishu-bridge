@@ -82,9 +82,10 @@ type GuestRecoveryInternals = {
     specs: () => [];
     resolveUserAccess: (feishuUserId: string) => Promise<Record<string, unknown>>;
     bindThreadAccess: (threadId: string, context: Record<string, unknown>) => void;
+    bindGuestPrompt: (threadId: string, context: Record<string, unknown>, text: string) => void;
   };
   desktop: {
-    moveThreadToProject: (threadId: string, projectId: string) => Promise<void>;
+    registerExternalThread: (threadId: string, projectId: string) => Promise<void>;
     refreshExternalThread: (threadId: string) => Promise<unknown>;
   };
   feishu: {
@@ -98,6 +99,8 @@ type GuestRecoveryInternals = {
   guestThreadInitializations: Map<string, Promise<unknown>>;
   guestProjectId: string;
   guestDesktopProjectId: string;
+  guestDesktopRegistrations: Set<string>;
+  guestDesktopSync: { enqueue: (threadId: string) => void; flush: () => Promise<void> };
   submitGuestPrompt: (openId: string, chatId: string, text: string) => Promise<void>;
   createNewGuestThread: (openId: string, chatId: string) => Promise<void>;
 };
@@ -210,6 +213,8 @@ test("同一会话运行时不自动分叉，提示切换会话并行", async ()
 test("管理员保留完整角色，其他用户在开启后自动进入访客角色", () => {
   const owners = new Set(["ou_owner"]);
   assert.equal(resolveAccessRole("ou_owner", owners, true), "owner");
+  assert.equal(resolveAccessRole("ou_owner", new Set(), true), "guest");
+  assert.equal(resolveAccessRole("ou_owner", new Set(), false), null);
   assert.equal(resolveAccessRole("ou_colleague", owners, true), "guest");
   assert.equal(resolveAccessRole("ou_colleague", owners, false), null);
 });
@@ -344,10 +349,13 @@ test("访客会话被 Desktop 占用时自动更换只读执行线程", async ()
   app.guestThreadInitializations = new Map();
   app.guestProjectId = "guest-project";
   app.guestDesktopProjectId = "desktop-project";
+  app.guestDesktopRegistrations = new Set();
+  app.guestDesktopSync = { enqueue() {}, async flush() { await app.desktop.refreshExternalThread("thread-new"); } };
   app.guestTools = {
     specs: () => [],
     async resolveUserAccess() { return {}; },
     bindThreadAccess() {},
+    bindGuestPrompt() {},
   };
   app.guestCodex = {
     async startReadOnlyTurn(threadId) {
@@ -355,7 +363,8 @@ test("访客会话被 Desktop 占用时自动更换只读执行线程", async ()
       if (threadId === "thread-locked") throw new Error(`thread ${threadId} already has an active writer`);
       return "turn-new";
     },
-    async createReadOnlyThread() {
+    async createReadOnlyThread(...args: unknown[]) {
+      assert.equal(args[4], "guest-project");
       calls.push("create");
       return thread("thread-new", "guest-project");
     },
@@ -364,7 +373,7 @@ test("访客会话被 Desktop 占用时自动更换只读执行线程", async ()
     },
   };
   app.desktop = {
-    async moveThreadToProject(threadId) {
+    async registerExternalThread(threadId) {
       calls.push(`move:${threadId}`);
     },
     async refreshExternalThread(threadId) {
@@ -423,14 +432,18 @@ test("访客 /new 新建只读会话并切换当前绑定", async () => {
   app.guestThreadInitializations = new Map();
   app.guestProjectId = "guest-project";
   app.guestDesktopProjectId = "desktop-project";
+  app.guestDesktopRegistrations = new Set();
+  app.guestDesktopSync = { enqueue() {}, async flush() {} };
   app.guestTools = {
     specs: () => [],
     async resolveUserAccess() { return {}; },
     bindThreadAccess() {},
+    bindGuestPrompt() {},
   };
   app.guestCodex = {
     async startReadOnlyTurn() { return "unused"; },
-    async createReadOnlyThread() {
+    async createReadOnlyThread(...args: unknown[]) {
+      assert.equal(args[4], "guest-project");
       calls.push("create");
       return thread("thread-new", "guest-project");
     },
@@ -439,7 +452,7 @@ test("访客 /new 新建只读会话并切换当前绑定", async () => {
     },
   };
   app.desktop = {
-    async moveThreadToProject(threadId, projectId) {
+    async registerExternalThread(threadId, projectId) {
       calls.push(`move:${threadId}:${projectId}`);
     },
     async refreshExternalThread() { return {}; },

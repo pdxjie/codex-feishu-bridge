@@ -112,6 +112,7 @@ export class DesktopCodexClient {
   private recoveryThreadIds: string[] = [];
   private lastWakeAt = 0;
   private wakeCandidateOffset = 0;
+  private readonly temporaryExternalPins = new Set<string>();
 
   constructor(private readonly logger: Logger, private readonly options: {
     socketDirectory?: string;
@@ -302,6 +303,32 @@ export class DesktopCodexClient {
       threadId,
       projectId,
     });
+  }
+
+  async registerExternalThread(threadId: string, projectId: string): Promise<void> {
+    try {
+      await this.refreshExternalThread(threadId, 1);
+      try { await this.moveThreadToProject(threadId, projectId); return; }
+      catch (error) {
+        if (!/not available in the sidebar/i.test(errorMessage(error))) throw error;
+      }
+      const caller = await this.resolveControllerThread(threadId);
+      const catalog = await this.callToolJson<{ pinnedThreads?: DesktopThreadSummary[] }>(caller, "list_threads", { limit: 1 });
+      const alreadyPinned = catalog.pinnedThreads?.some((thread) => thread.id === threadId) ?? false;
+      // A normal pin hydrates the sidebar without resuming a writer. Remember
+      // cleanup across retries if the unpin response is lost during reconnect.
+      if (!alreadyPinned) {
+        this.temporaryExternalPins.add(threadId);
+        await this.callTool(caller, "set_thread_pinned", { threadId, pinned: true });
+      }
+      await this.moveThreadToProject(threadId, projectId);
+    } finally {
+      if (this.temporaryExternalPins.has(threadId)) {
+        const caller = await this.resolveControllerThread(threadId);
+        await this.callTool(caller, "set_thread_pinned", { threadId, pinned: false });
+        this.temporaryExternalPins.delete(threadId);
+      }
+    }
   }
 
   async setThreadTitle(threadId: string, title: string): Promise<void> {
@@ -616,7 +643,10 @@ export async function discoverDesktopSocketPaths(directory = "/tmp/codex-app-too
 }
 
 export function isDesktopTransportError(error: unknown): boolean {
-  return /ECONNREFUSED|ECONNRESET|ENOENT|EPIPE|连接|通道|调用超时|Desktop 自动唤醒|helper.*(?:关闭|停止|退出|未连接)/i.test(errorMessage(error));
+  const code = isRecord(error) ? error.code : undefined;
+  if (typeof code === "string" && ["ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE", "ETIMEDOUT",
+    "ERR_STREAM_DESTROYED", "ERR_STREAM_WRITE_AFTER_END", "ERR_STREAM_PREMATURE_CLOSE", "ERR_SOCKET_CLOSED"].includes(code)) return true;
+  return /ECONNREFUSED|ECONNRESET|ENOENT|EPIPE|stream (?:was )?(?:destroyed|closed)|write after end|socket is closed|连接|通道|调用超时|Desktop 自动唤醒|helper.*(?:关闭|停止|退出|未连接)/i.test(errorMessage(error));
 }
 
 export async function discoverHelperSocketPaths(base: string): Promise<string[]> {

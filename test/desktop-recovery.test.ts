@@ -6,11 +6,17 @@ import net, { type Socket } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { DesktopCodexClient, DesktopThreadUnavailableError } from "../src/codex/desktop-client.js";
+import { DesktopCodexClient, DesktopThreadUnavailableError, isDesktopTransportError } from "../src/codex/desktop-client.js";
 import { Logger } from "../src/logger.js";
 
 const tools = ["send_message_to_thread", "read_thread", "list_threads", "list_projects", "create_thread"];
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("a stream destroyed during helper exit is a transport failure, not a missing thread", () => {
+  assert.equal(isDesktopTransportError(Object.assign(new Error("Cannot call write after a stream was destroyed"), { code: "ERR_STREAM_DESTROYED" })), true);
+  assert.equal(isDesktopTransportError(new Error("Cannot call write after a stream was destroyed")), true);
+  assert.equal(isDesktopTransportError(new Error("The task is not available in the sidebar.")), false);
+});
 
 test("Desktop recovers helper loss, downstream disconnect, pipe rotation without replaying mutations", { timeout: 30_000 }, async (t) => {
   const root = await mkdtemp("/tmp/feishu-recovery-");

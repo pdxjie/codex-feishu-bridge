@@ -92,6 +92,52 @@ test("访客只能通过受控工具生成导出文件并在发送后清理", as
   assert.equal(existsSync(files[0]!.path), false);
 });
 
+test("库存工具查询和导出不经过页面猜测，使用固定SQL；每次刷新角色，撤销后拒绝访问", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-feishu-inventory-tool-"));
+  const gatewayPath = join(root, "gateway.mjs");
+  const queryLog = join(root, "queries.txt");
+  writeFileSync(gatewayPath, `import { appendFileSync } from 'node:fs';
+    export class DatabaseGateway {
+      profile() { return { environment: 'production', mode: 'readonly' }; }
+      async query(name, sql, maxRows) {
+        appendFileSync(${JSON.stringify(queryLog)}, sql + '\\n');
+        return { rows: [{ sku: 'G10050LG01A-JH', stock: 12 }], rowCount: 1, truncated: false, maxRows };
+      }
+    }`);
+  let currentContext = { ...TEST_CONTEXT, superAdministrator: false, inventoryOperationsRole: true,
+    dataScope: { ...TEST_CONTEXT.dataScope, platforms: [1], shopGroups: [{ platform: 1, shop: 0, marketplace: 0 }] } };
+  let pageCalls = 0;
+  const guard = createTestAccessGuard();
+  guard.contextForThread = async () => currentContext;
+  guard.authorizePage = async () => { pageCalls++; throw new Error("权限不足：没有仓储页面"); };
+  const tools = new GuestReadonlyTools(root, "unused", "production", logger, gatewayPath, join(root, "exports"), 10000, undefined, guard);
+  const args = { dataset: "stock", sku: "G10050LG01A-JH", platformId: 1 };
+  const queryResult = await tools.handle(call("inventory_diagnose", args));
+  assert.match(queryResult.contentItems[0]!.text, /G10050LG01A-JH/);
+  const exported = await tools.handle(call("inventory_export_file", { ...args, title: "库存证据", fileName: "库存证据.xlsx", maxRows: 10000 }));
+  assert.match(exported.contentItems[0]!.text, /created/);
+  const files = tools.takeExportFiles("guest-turn");
+  assert.equal(files.length, 1);
+  await tools.removeExportFiles(files);
+  assert.equal(pageCalls, 0);
+  const logBefore = readFileSync(queryLog, "utf8");
+  assert.match(logBefore, /LIMIT 10001/);
+  await assert.rejects(() => tools.handle(call("inventory_diagnose", { ...args, sql: "SELECT * FROM mc_user" })), /不接受参数/);
+  currentContext = { ...currentContext, inventoryOperationsRole: false };
+  await assert.rejects(() => tools.handle(call("inventory_diagnose", args)), /暂无法确认数据授权范围/);
+  await assert.rejects(() => tools.handle(call("inventory_export_file", { ...args, title: "库存证据", fileName: "库存证据.xlsx" })), /暂无法确认数据授权范围/);
+  assert.equal(readFileSync(queryLog, "utf8"), logBefore);
+});
+
+test("页面未匹配返回范围未确认，不能产生用户无权的结论", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-feishu-page-search-"));
+  const tools = testTools(root);
+  const result = await tools.handle(call("erp_page_access", { query: "亚马逊库存追溯" }));
+  const value = JSON.parse(result.contentItems[0]!.text);
+  assert.equal(value.status, "authorization_scope_unconfirmed");
+  assert.deepEqual(value.candidates, []);
+});
+
 function call(tool: string, args: Record<string, unknown>) {
   return {
     threadId: "guest-thread",
