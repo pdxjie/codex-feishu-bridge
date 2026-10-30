@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, basename, join } from "node:path";
 import { createInterface } from "node:readline";
 import net from "node:net";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH?.trim();
 const bridgeSocketPath = process.env.CODEX_FEISHU_HELPER_SOCKET?.trim();
+// Each Desktop-owned MCP process owns its own socket. No shared pathname can
+// disappear when another session's helper exits; clients discover all owners.
+const ownedSocketPath = bridgeSocketPath
+  ? join(dirname(bridgeSocketPath), `${basename(bridgeSocketPath, ".sock")}-${process.pid}.sock`)
+  : null;
 
 if (!pipePath && !bridgeSocketPath) {
   process.stderr.write("缺少 CODEX_APP_TOOLS_PIPE_PATH 或 CODEX_FEISHU_HELPER_SOCKET\n");
@@ -30,7 +35,11 @@ class NativePipeClient {
 
     const id = this.nextId++;
     const response = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.onDisconnect(socket, new Error("Codex Desktop 通道请求超时"));
+      }, 18_000);
+      timer.unref();
+      this.pending.set(id, { resolve, reject, timer });
     });
     socket.write(encodeFrame(JSON.stringify({ jsonrpc: "2.0", id, method, params })));
     return response;
@@ -42,12 +51,15 @@ class NativePipeClient {
 
     this.connecting = new Promise((resolve, reject) => {
       const socket = net.createConnection(this.path);
+      const timer = setTimeout(() => fail(new Error("Codex Desktop 通道连接超时")), 2_000);
       const fail = (error) => {
+        clearTimeout(timer);
         socket.destroy();
         reject(error);
       };
       socket.once("error", fail);
       socket.once("connect", () => {
+        clearTimeout(timer);
         socket.off("error", fail);
         this.socket = socket;
         this.connecting = null;
@@ -88,6 +100,7 @@ class NativePipeClient {
       const pending = this.pending.get(Number(message.id));
       if (!pending) continue;
       this.pending.delete(Number(message.id));
+      clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(message.error.message || "Codex Desktop 工具调用失败"));
       else pending.resolve(message.result);
     }
@@ -96,14 +109,17 @@ class NativePipeClient {
   onDisconnect(socket, error) {
     if (socket !== this.socket) return;
     this.socket = null;
+    socket.destroy();
     this.pendingData = Buffer.alloc(0);
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
   }
 
   close() {
-    this.socket?.destroy();
-    this.socket = null;
+    if (this.socket) this.onDisconnect(this.socket, new Error("Codex Desktop 通道已关闭"));
   }
 }
 
@@ -181,16 +197,11 @@ function handleLine(line, send) {
 let bridgeServer = null;
 if (bridgeSocketPath) {
   // 在受信任的 Codex 进程链仍然存在时提前建立 Desktop 连接；宿主会校验连接方进程来源。
-  if (pipePath) await listTools({});
+  if (pipePath) await listTools({}).catch((error) => process.stderr.write(`Desktop 预连接失败，将在请求时重试：${error.message}\n`));
   mkdirSync(dirname(bridgeSocketPath), { recursive: true, mode: 0o700 });
-  const existingHelper = await socketIsActive(bridgeSocketPath);
-  if (!existingHelper) {
-    try {
-      unlinkSync(bridgeSocketPath);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
+  {
     bridgeServer = net.createServer((socket) => {
+      socket.on("error", () => socket.destroy());
       socket.setEncoding("utf8");
       let buffer = "";
       socket.on("data", (chunk) => {
@@ -200,11 +211,13 @@ if (bridgeSocketPath) {
           if (newline < 0) break;
           const line = buffer.slice(0, newline).trim();
           buffer = buffer.slice(newline + 1);
-          if (line) handleLine(line, (response) => socket.write(`${JSON.stringify(response)}\n`));
+          if (line) handleLine(line, (response) => {
+            if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
+          });
         }
       });
     });
-    bridgeServer.listen(bridgeSocketPath, () => chmodSync(bridgeSocketPath, 0o600));
+    bridgeServer.listen(ownedSocketPath, () => chmodSync(ownedSocketPath, 0o600));
   }
 
   // 作为 Codex Desktop 的轻量 MCP 常驻进程运行。Desktop 负责启动它，因此满足本地通道的进程校验。
@@ -242,31 +255,14 @@ if (bridgeSocketPath) {
 function shutdown() {
   for (const native of nativeByPath.values()) native.close();
   bridgeServer?.close();
-  if (bridgeSocketPath && bridgeServer) {
+  if (ownedSocketPath && bridgeServer) {
     try {
-      unlinkSync(bridgeSocketPath);
+      unlinkSync(ownedSocketPath);
     } catch {
       // 已经不存在。
     }
   }
   process.exit(0);
-}
-
-function socketIsActive(path) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection(path);
-    const timer = setTimeout(() => {
-      socket.destroy();
-      resolve(false);
-    }, 300);
-    const finish = (active) => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(active);
-    };
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-  });
 }
 
 process.once("SIGINT", shutdown);

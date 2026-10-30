@@ -26,7 +26,7 @@ const schema = z.object({
   GUEST_DB_CONNECTION: z.string().default("production"),
   GUEST_MAX_CONCURRENT_TURNS: z.coerce.number().int().min(1).max(20).default(4),
   GUEST_EXPORT_ROOT: z.string().default("./data/exports"),
-  GUEST_EXPORT_MAX_ROWS: z.coerce.number().int().min(1).max(1000).default(1000),
+  GUEST_EXPORT_MAX_ROWS: z.coerce.number().int().min(1).max(10_000).default(10_000),
   STATE_DB_PATH: z.string().default("./data/state.db"),
   CODEX_BIN: z.string().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),

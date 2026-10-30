@@ -47,7 +47,7 @@ export class GuestReadonlyTools {
     private readonly logger: Logger,
     private readonly databaseGatewayPath = join(projectRoot, "tools", "mc-kb", "src", "database-gateway.js"),
     exportRoot = join(projectRoot, ".codex-feishu-exports"),
-    private readonly exportMaxRows = 1000,
+    private readonly exportMaxRows = 10_000,
     accessIndexPath?: string,
     accessGuard?: GuestAccessGuard,
   ) {

@@ -116,7 +116,20 @@ export class BridgeApp {
       this.guestTools = null;
       this.guestCodex = null;
     }
-    this.desktop = new DesktopCodexClient(logger);
+    this.desktop = new DesktopCodexClient(logger, {
+      recoveryCandidates: async () => {
+        // Use the persistent App Server catalog even when every Desktop helper
+        // has been evicted. Never load a guest-owned thread to recover admin MCP.
+        const { data } = await this.codex.listThreads(100);
+        return data.filter((thread) => {
+          if (this.activeTurns.has(thread.id) || this.store.getGuestThread(thread.id)) return false;
+          if (thread.status?.type === "inProgress") return false;
+          if (config.guestWorkspaceRoot && resolve(thread.cwd) === resolve(config.guestWorkspaceRoot)) return false;
+          try { assertWorkspaceAllowed(thread.cwd, config.allowedWorkspaceRoots); return true; }
+          catch { return false; }
+        }).map((thread) => thread.id);
+      },
+    });
     this.feishu = new FeishuClient(config.feishuAppId, config.feishuAppSecret, logger);
 
     this.feishu.onMessage((message) => this.onMessage(message));

@@ -2,11 +2,13 @@ import "dotenv/config";
 import { BridgeApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { Logger } from "./logger.js";
+import { keepSystemAwake } from "./power.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = new Logger(config.logLevel);
   const app = new BridgeApp(config, logger);
+  const releaseWakeLock = keepSystemAwake(logger);
 
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {
@@ -14,6 +16,7 @@ async function main(): Promise<void> {
     stopping = true;
     logger.info(`收到 ${signal}，正在停止服务`);
     await app.stop();
+    releaseWakeLock();
     process.exit(0);
   };
 

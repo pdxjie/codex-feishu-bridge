@@ -1,13 +1,11 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { createInterface, type Interface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import net, { type Socket } from "node:net";
 import type { Logger } from "../logger.js";
 
-const DEFAULT_CUA_NODE = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node";
 const DEFAULT_HELPER_SOCKET = join(homedir(), "Library", "Application Support", "CodexFeishuBridge", "desktop-helper.sock");
 const REQUEST_TIMEOUT_MS = 20_000;
 
@@ -102,7 +100,6 @@ export class DesktopThreadUnavailableError extends Error {
 }
 
 export class DesktopCodexClient {
-  private child: ChildProcessWithoutNullStreams | null = null;
   private bridgeSocket: Socket | null = null;
   private lines: Interface | null = null;
   private desktopPipePath: string | null = null;
@@ -110,63 +107,135 @@ export class DesktopCodexClient {
   private readonly pending = new Map<number, PendingRequest>();
   private controllerThreadId: string | null = null;
   private reconnecting: Promise<void> | null = null;
+  private healthTimer: NodeJS.Timeout | null = null;
+  private stopped = false;
+  private recoveryThreadIds: string[] = [];
+  private lastWakeAt = 0;
+  private wakeCandidateOffset = 0;
 
-  constructor(private readonly logger: Logger) {}
+  constructor(private readonly logger: Logger, private readonly options: {
+    socketDirectory?: string;
+    helperSocketPath?: string;
+    healthIntervalMs?: number;
+    wakeDesktop?: (threadId: string) => Promise<void>;
+    recoveryCandidates?: () => Promise<string[]>;
+    wakeCooldownMs?: number;
+    wakeTimeoutMs?: number;
+    wakePollMs?: number;
+  } = {}) {}
 
   async start(): Promise<void> {
-    if (this.child) return;
-    const socketPaths = await discoverDesktopSocketPaths();
+    this.stopped = false;
+    await this.reconnect();
+    if (!this.healthTimer && !this.stopped) {
+      this.healthTimer = setInterval(() => {
+        if (this.pending.size || this.reconnecting) return;
+        void this.healthCheck().catch((error) => this.logger.warn("Desktop 后台探活失败，将自动重试", errorMessage(error)));
+      }, this.options.healthIntervalMs ?? 30_000);
+      this.healthTimer.unref();
+    }
+  }
+
+  private reconnect(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("Codex Desktop 客户端已停止"));
+    if (!this.reconnecting) {
+      this.reconnecting = this.connectOrWakeDesktop().finally(() => { this.reconnecting = null; });
+    }
+    return this.reconnecting;
+  }
+
+  private async connectOrWakeDesktop(): Promise<void> {
+    try { await this.connectAvailableHelper(); return; }
+    catch (initialError) {
+      if (this.stopped || !isDesktopTransportError(initialError)) throw initialError;
+      const cooldown = this.options.wakeCooldownMs ?? 60_000;
+      if (this.lastWakeAt && Date.now() - this.lastWakeAt < cooldown) throw initialError;
+      this.lastWakeAt = Date.now();
+      const fallback = await (this.options.recoveryCandidates?.() ?? this.readRecentThreadIdsFromRollouts());
+      const cached = this.options.recoveryCandidates
+        ? this.recoveryThreadIds.filter((id) => fallback.includes(id)) : this.recoveryThreadIds;
+      const allCandidates = [...new Set([...cached, ...fallback])]
+        .filter((id) => /^[0-9a-f-]{36}$/i.test(id));
+      const offset = this.wakeCandidateOffset % Math.max(1, allCandidates.length);
+      const candidates = [...allCandidates.slice(offset), ...allCandidates.slice(0, offset)].slice(0, 3);
+      this.wakeCandidateOffset = offset + candidates.length;
+      let lastError: unknown = initialError;
+      // Opening an existing cold thread lets Desktop start its own MCP helper.
+      // Never launch a detached replacement with untrusted process ancestry,
+      // send a prompt, or create/fork a thread to recover the transport.
+      for (const threadId of candidates) {
+        if (this.stopped) break;
+        this.logger.warn("Desktop helper 全部不可用，正在通过会话链接唤醒", { threadId });
+        try { await (this.options.wakeDesktop ?? openDesktopThread)(threadId); }
+        catch (error) { lastError = error; continue; }
+        const deadline = Date.now() + (this.options.wakeTimeoutMs ?? 8_000);
+        while (!this.stopped && Date.now() < deadline) {
+          await delay(this.options.wakePollMs ?? 1_000);
+          if (this.stopped) break;
+          try {
+            await this.connectAvailableHelper();
+            this.recoveryThreadIds = [threadId, ...this.recoveryThreadIds.filter((id) => id !== threadId)];
+            this.logger.info("Desktop helper 已由桌面会话重新启动，连接恢复", { threadId });
+            return;
+          } catch (error) { lastError = error; }
+        }
+      }
+      // Throttle from the end of the attempt, including slow Desktop launches.
+      this.lastWakeAt = Date.now();
+      throw new Error(`Desktop 自动唤醒暂未成功，将继续后台恢复：${errorMessage(lastError)}`);
+    }
+  }
+
+  private async connectAvailableHelper(): Promise<void> {
+    await this.stopHelper();
+    this.controllerThreadId = null;
+    const socketPaths = await discoverDesktopSocketPaths(this.options.socketDirectory);
     if (socketPaths.length === 0) {
       throw new Error("没有发现 Codex Desktop 本地通道，请先启动并登录 Codex Desktop。");
     }
 
-    let lastError: unknown;
-    let daemonConnected = false;
-    try {
-      await this.connectHelperDaemon();
-      daemonConnected = true;
-    } catch (error) {
-      this.logger.warn("Codex Desktop helper 常驻进程尚未连接，尝试临时进程", errorMessage(error));
-    }
-    for (const socketPath of socketPaths) {
-      try {
-        if (!daemonConnected) await this.startHelper(socketPath);
-        this.desktopPipePath = socketPath;
-        const ping = await this.request<{ tools?: string[] }>({ method: "ping" }, 5_000);
-        const required = ["send_message_to_thread", "read_thread", "list_threads", "list_projects", "create_thread"];
-        if (!required.every((name) => ping.tools?.includes(name))) {
-          throw new Error("Codex Desktop 缺少会话互通工具，请升级桌面应用。");
+    const helperPaths = await discoverHelperSocketPaths(this.options.helperSocketPath
+      ?? process.env.CODEX_FEISHU_HELPER_SOCKET?.trim() ?? DEFAULT_HELPER_SOCKET);
+    const errors: string[] = [];
+    for (const helperPath of helperPaths) {
+      if (this.stopped) break;
+      try { await this.connectHelperDaemon(helperPath); }
+      catch (error) { errors.push(errorMessage(error)); continue; }
+      for (const socketPath of socketPaths) {
+        if (this.stopped) break;
+        try {
+          this.desktopPipePath = socketPath;
+          const ping = await this.request<{ tools?: string[] }>({ method: "ping" }, 5_000);
+          const required = ["send_message_to_thread", "read_thread", "list_threads", "list_projects", "create_thread"];
+          if (!required.every((name) => ping.tools?.includes(name))) {
+            throw new Error("Codex Desktop 缺少会话互通工具，请升级桌面应用。");
+          }
+          this.logger.info("Codex Desktop 实时会话通道已连接", { socketPath, helperPath });
+          return;
+        } catch (error) {
+          errors.push(errorMessage(error));
+          this.logger.warn("Codex Desktop 通道候选连接失败", { socketPath, error: errorMessage(error) });
         }
-        this.logger.info("Codex Desktop 实时会话通道已连接", { socketPath });
-        return;
-      } catch (error) {
-        lastError = error;
-        this.logger.warn("Codex Desktop 通道候选连接失败", { socketPath, error: errorMessage(error) });
-        if (!daemonConnected) await this.stopHelper();
       }
+      await this.stopHelper();
     }
     await this.stopHelper();
-    throw new Error(`无法连接 Codex Desktop 实时会话通道：${errorMessage(lastError)}`);
+    throw new Error(`无法连接 Codex Desktop 实时会话通道，服务会自动重连。请保持 Desktop 运行。${errors.slice(0, 2).join("；") || "Desktop helper 尚未启动"}`);
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = null;
+    await this.reconnecting?.catch(() => {});
     await this.stopHelper();
   }
 
   async sendMessage(threadId: string, prompt: string): Promise<void> {
     await this.ensureThreadLoaded(threadId);
     const callerThreadId = await this.resolveControllerThread(threadId);
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      if (attempt > 0) await delay(300 * attempt);
-      try {
-        await this.callTool(callerThreadId, "send_message_to_thread", { threadId, prompt });
-        return;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    // Never replay a mutation after an ambiguous disconnect/timeout.
+    await this.callTool(callerThreadId, "send_message_to_thread", { threadId, prompt });
   }
 
   async readThread(threadId: string, turnLimit = 3): Promise<DesktopThreadSnapshot> {
@@ -185,6 +254,7 @@ export class DesktopCodexClient {
       await this.readThreadRaw(threadId, 1);
       return;
     } catch (initialError) {
+      if (isDesktopTransportError(initialError)) throw initialError;
       if (!(await this.hasLocalRollout(threadId))) {
         throw new DesktopThreadUnavailableError(threadId);
       }
@@ -199,6 +269,7 @@ export class DesktopCodexClient {
           await this.readThreadRaw(threadId, 1);
           return;
         } catch (error) {
+          if (isDesktopTransportError(error)) throw error;
           lastError = error;
         }
       }
@@ -308,6 +379,9 @@ export class DesktopCodexClient {
   }
 
   async healthCheck(): Promise<{ socketConnected: true; controllerThreadId: string }> {
+    await this.ensureHelperConnected();
+    try { await this.request({ method: "ping" }, 5_000); }
+    catch { await this.reconnect(); }
     const controllerThreadId = await this.resolveControllerThread("");
     return { socketConnected: true, controllerThreadId };
   }
@@ -329,6 +403,11 @@ export class DesktopCodexClient {
       threads?: DesktopThreadSummary[];
     }>(caller, "list_threads", { limit: 50 });
     const threads = [...(catalog.pinnedThreads ?? []), ...(catalog.threads ?? [])];
+    const localThreads = threads.filter((thread) => thread.kind === "codex" && (!thread.hostId || thread.hostId === "local"));
+    this.recoveryThreadIds = [...new Set([
+      ...this.recoveryThreadIds,
+      ...localThreads.filter((thread) => thread.id !== targetThreadId).map((thread) => thread.id),
+    ])].slice(0, 10);
     const controller = threads.find(
       (thread) => thread.kind === "codex" && thread.id !== targetThreadId && (!thread.hostId || thread.hostId === "local"),
     );
@@ -337,15 +416,20 @@ export class DesktopCodexClient {
   }
 
   private async readRecentThreadIdFromRollouts(): Promise<string | null> {
+    return (await this.readRecentThreadIdsFromRollouts())[0] ?? null;
+  }
+
+  private async readRecentThreadIdsFromRollouts(): Promise<string[]> {
     const sessionsRoot = join(homedir(), ".codex", "sessions");
     const candidates: Array<{ path: string; mtimeMs: number }> = [];
     await collectRecentJsonl(sessionsRoot, candidates, 80);
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const ids: string[] = [];
     for (const candidate of candidates.slice(0, 20)) {
       const match = /rollout-.*-([0-9a-f-]{36})\.jsonl$/i.exec(candidate.path);
-      if (match?.[1]) return match[1];
+      if (match?.[1]) ids.push(match[1]);
     }
-    return null;
+    return ids;
   }
 
   private async callToolJson<T>(callerThreadId: string, tool: string, args: Record<string, unknown>): Promise<T> {
@@ -365,12 +449,29 @@ export class DesktopCodexClient {
     args: Record<string, unknown>,
   ): Promise<ToolResult> {
     await this.ensureHelperConnected();
-    const result = await this.request<ToolResult>({
+    const readonly = ["read_thread", "list_threads", "list_projects"].includes(tool);
+    if (!readonly) {
+      // A harmless probe may reconnect before a mutation is sent. Once sent,
+      // a lost reply is ambiguous and must never trigger automatic resubmission.
+      try { await this.request({ method: "ping" }, 5_000); }
+      catch { await this.reconnect(); }
+    }
+    const payload = {
       method: "call",
       tool,
       callerThreadId,
       arguments: args,
-    });
+    };
+    let result: ToolResult;
+    try { result = await this.request<ToolResult>(payload); }
+    catch (error) {
+      if (!isDesktopTransportError(error)) throw error;
+      if (!readonly) {
+        throw new Error(`Desktop 连接中断，${tool} 的执行结果尚未确认；为避免重复执行未自动重发。${errorMessage(error)}`);
+      }
+      await this.reconnect();
+      result = await this.request<ToolResult>(payload);
+    }
     if (!result.success) {
       const message = result.contentItems
         .filter((item): item is { type: "inputText"; text: string } => item.type === "inputText")
@@ -382,47 +483,14 @@ export class DesktopCodexClient {
   }
 
   private async ensureHelperConnected(): Promise<void> {
-    const childConnected = Boolean(this.child?.stdin && !this.child.stdin.destroyed);
+    if (this.stopped) throw new Error("Codex Desktop 客户端已停止");
+    if (this.reconnecting) return this.reconnecting;
     const daemonConnected = Boolean(this.bridgeSocket && !this.bridgeSocket.destroyed);
-    if (childConnected || daemonConnected) return;
-    if (!this.reconnecting) {
-      this.controllerThreadId = null;
-      this.desktopPipePath = null;
-      this.reconnecting = this.start().finally(() => {
-        this.reconnecting = null;
-      });
-    }
-    await this.reconnecting;
+    if (daemonConnected) return;
+    await this.reconnect();
   }
 
-  private async startHelper(socketPath: string): Promise<void> {
-    const nodePath = process.env.CODEX_DESKTOP_NODE?.trim() || DEFAULT_CUA_NODE;
-    if (!existsSync(nodePath)) throw new Error(`找不到 Codex Desktop Node：${nodePath}`);
-    const helperPath = fileURLToPath(new URL("./desktop-helper.mjs", import.meta.url));
-    if (!existsSync(helperPath)) throw new Error(`找不到 Desktop helper：${helperPath}`);
-
-    const child = spawn(nodePath, [helperPath], {
-      env: { ...process.env, CODEX_APP_TOOLS_PIPE_PATH: socketPath },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.child = child;
-    this.lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.lines.on("line", (line) => this.handleLine(line));
-    child.stderr.on("data", (chunk) => {
-      const message = chunk.toString().trim();
-      if (message) this.logger.warn("Codex Desktop helper 输出", message);
-    });
-    child.once("exit", (code, signal) => {
-      if (this.child !== child) return;
-      this.child = null;
-      this.lines?.close();
-      this.lines = null;
-      this.rejectPending(new Error(`Codex Desktop helper 已退出（code=${String(code)}, signal=${String(signal)}）`));
-    });
-  }
-
-  private async connectHelperDaemon(): Promise<void> {
-    const path = process.env.CODEX_FEISHU_HELPER_SOCKET?.trim() || DEFAULT_HELPER_SOCKET;
+  private async connectHelperDaemon(path: string): Promise<void> {
     const socket = net.createConnection(path);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -436,10 +504,15 @@ export class DesktopCodexClient {
       });
       socket.once("error", (error) => {
         clearTimeout(timer);
+        socket.destroy();
         reject(error);
       });
     });
     this.bridgeSocket = socket;
+    socket.on("error", (error) => {
+      if (this.bridgeSocket === socket) this.rejectPending(error);
+      socket.destroy();
+    });
     this.lines = createInterface({ input: socket, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.handleLine(line));
     socket.once("close", () => {
@@ -452,9 +525,8 @@ export class DesktopCodexClient {
   }
 
   private request<T>(payload: Record<string, unknown>, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
-    const child = this.child;
     const socket = this.bridgeSocket;
-    if ((!child?.stdin || child.stdin.destroyed) && (!socket || socket.destroyed)) {
+    if (!socket || socket.destroyed) {
       return Promise.reject(new Error("Codex Desktop helper 未连接。"));
     }
     const id = this.nextId++;
@@ -470,8 +542,14 @@ export class DesktopCodexClient {
         timer,
       });
       const line = `${JSON.stringify({ id, desktopPipePath: this.desktopPipePath, ...payload })}\n`;
-      if (socket && !socket.destroyed) socket.write(line);
-      else child?.stdin.write(line);
+      socket.write(line, (error) => {
+        if (!error) return;
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      });
     });
   }
 
@@ -504,30 +582,14 @@ export class DesktopCodexClient {
     const socket = this.bridgeSocket;
     this.bridgeSocket = null;
     socket?.destroy();
-    const child = this.child;
-    this.child = null;
     this.lines?.close();
     this.lines = null;
     this.rejectPending(new Error("Codex Desktop helper 已停止。"));
-    if (!child) return;
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve();
-      }, 2_000);
-      timer.unref();
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
   }
 }
 
-export async function discoverDesktopSocketPaths(): Promise<string[]> {
+export async function discoverDesktopSocketPaths(directory = "/tmp/codex-app-tools"): Promise<string[]> {
   // Codex Desktop 在 macOS 上固定使用 /tmp；os.tmpdir() 通常指向 /var/folders/...，两者并不相同。
-  const directory = "/tmp/codex-app-tools";
   let names: string[];
   try {
     names = await fs.readdir(directory);
@@ -553,6 +615,24 @@ export async function discoverDesktopSocketPaths(): Promise<string[]> {
     .map((entry) => entry.path);
 }
 
+export function isDesktopTransportError(error: unknown): boolean {
+  return /ECONNREFUSED|ECONNRESET|ENOENT|EPIPE|连接|通道|调用超时|Desktop 自动唤醒|helper.*(?:关闭|停止|退出|未连接)/i.test(errorMessage(error));
+}
+
+export async function discoverHelperSocketPaths(base: string): Promise<string[]> {
+  const directory = dirname(base);
+  const prefix = `${basename(base, ".sock")}-`;
+  let names: string[];
+  try { names = await fs.readdir(directory); } catch { return [base]; }
+  const entries = await Promise.all(names.filter((name) => name.startsWith(prefix) && name.endsWith(".sock"))
+    .map(async (name) => {
+      const path = join(directory, name);
+      try { const stat = await fs.stat(path); return stat.isSocket() ? { path, time: stat.mtimeMs } : null; }
+      catch { return null; }
+    }));
+  return [...entries.filter((entry) => entry !== null).sort((a, b) => b.time - a.time).map((entry) => entry.path), base];
+}
+
 async function collectRecentJsonl(
   directory: string,
   output: Array<{ path: string; mtimeMs: number }>,
@@ -565,6 +645,9 @@ async function collectRecentJsonl(
   } catch {
     return;
   }
+  // Session directories use YYYY/MM/DD names; visit newest first before
+  // applying the scan limit, otherwise "recent" selects years-old sessions.
+  entries.sort((a, b) => b.name.localeCompare(a.name));
   for (const entry of entries) {
     if (output.length >= limit) break;
     const path = join(directory, entry.name);
@@ -592,7 +675,7 @@ function delay(ms: number): Promise<void> {
 async function openDesktopThread(threadId: string): Promise<void> {
   if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new DesktopThreadUnavailableError(threadId, "无效的 Codex 会话 ID。");
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("/usr/bin/open", [`codex://threads/${threadId}`], { stdio: "ignore" });
+    const child = spawn("/usr/bin/open", ["-g", `codex://threads/${threadId}`], { stdio: "ignore" });
     child.once("error", reject);
     child.once("exit", (code) => {
       if (code === 0) resolve();
