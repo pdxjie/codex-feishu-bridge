@@ -2,8 +2,8 @@ import "dotenv/config";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { promises as fs, createReadStream } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { validateEndpoint } from "./guest/native-export-protocol.js";
 
@@ -13,8 +13,10 @@ const project = resolve(process.env.ERP_NATIVE_EXPORT_PROJECT_ROOT ?? join(homed
 const php = process.env.ERP_NATIVE_EXPORT_PHP_BIN ?? join(homedir(), "Library/PhpWebStudy/env/php/php");
 const root = resolve(process.env.GUEST_EXPORT_ROOT ?? "data/exports", "erp-native-server");
 const secretFile = process.env.ERP_NATIVE_EXPORT_SECRET_FILE;
+const databaseConfigFile = resolve(process.env.GUEST_DB_CONFIG_PATH ?? join(homedir(), ".config/mc-ai/connections.json"));
 const endpoint = new URL(validateEndpoint(process.env.ERP_NATIVE_EXPORT_URL ?? "http://127.0.0.1:23419/native-export"));
 if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || endpoint.pathname !== "/native-export" || endpoint.search || !secretFile) throw new Error("本机导出服务需要127.0.0.1地址、/native-export路径和私有凭证文件。");
+const privateSecretFile = resolve(secretFile);
 await fs.mkdir(root, { recursive: true, mode: 0o700 });
 const privateRoot = await fs.realpath(root);
 const script = join(project, "tools/codex-export-local.php");
@@ -22,14 +24,16 @@ await fs.access(script);
 const childEnv = {
   PATH: process.env.PATH, TZ: "Asia/Shanghai",
   MC_BRIDGE_EXPORT_ROOT: privateRoot,
-  MC_BRIDGE_EXPORT_SECRET_FILE: resolve(secretFile),
-  MC_BRIDGE_EXPORT_DB_CONFIG_FILE: resolve(process.env.GUEST_DB_CONFIG_PATH ?? join(homedir(), ".config/mc-ai/connections.json")),
+  MC_BRIDGE_EXPORT_SECRET_FILE: privateSecretFile,
+  MC_BRIDGE_EXPORT_DB_CONFIG_FILE: databaseConfigFile,
 };
 let active = 0;
 const children = new Set<ReturnType<typeof spawn>>();
 function phpRequest(input: Record<string, unknown>): Promise<{ statusCode: number; result: Record<string, unknown> }> {
   return new Promise((resolveRequest, reject) => {
-    const child = spawn(php, ["-d", "memory_limit=512M", "-d", "display_errors=0", script], { cwd: project, env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+    const disabled = "exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec";
+    const openBasedir = [project, privateRoot, dirname(privateSecretFile), dirname(databaseConfigFile), resolve(tmpdir())].join(delimiter);
+    const child = spawn(php, ["-d", "memory_limit=512M", "-d", "max_execution_time=170", "-d", "display_errors=0", "-d", "allow_url_fopen=0", "-d", `disable_functions=${disabled}`, "-d", `open_basedir=${openBasedir}`, script], { cwd: project, env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
     children.add(child);
     let output = "";
     child.stderr!.on("data", (chunk: Buffer) => {

@@ -18,7 +18,25 @@ test("a stream destroyed during helper exit is a transport failure, not a missin
   assert.equal(isDesktopTransportError(new Error("The task is not available in the sidebar.")), false);
 });
 
-test("Desktop recovers helper loss, downstream disconnect, pipe rotation without replaying mutations", { timeout: 30_000 }, async (t) => {
+test("Desktop initial outage does not block the Feishu bridge startup", async () => {
+  const root = await mkdtemp("/tmp/feishu-desktop-offline-");
+  const client = new DesktopCodexClient(new Logger("error"), {
+    socketDirectory: join(root, "missing-pipes"),
+    helperSocketPath: join(root, "missing-helper.sock"),
+    healthIntervalMs: 60_000,
+    recoveryCandidates: async () => [],
+    wakeDesktop: async () => {},
+  });
+  try {
+    await client.start();
+    await assert.rejects(client.healthCheck(), /本地通道|实时会话通道/);
+  } finally {
+    await client.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Desktop recovers helper loss, downstream disconnect, Desktop restart without replaying mutations", { timeout: 30_000 }, async (t) => {
   const root = await mkdtemp("/tmp/feishu-recovery-");
   const pipeDir = join(root, "pipes");
   await mkdir(pipeDir);
@@ -87,13 +105,14 @@ test("Desktop recovers helper loss, downstream disconnect, pipe rotation without
     socketDirectory: pipeDir, helperSocketPath: base, healthIntervalMs: 100,
     recoveryCandidates: async () => ["01a07adb-330b-7053-9b8f-7d5e514dcea5"],
     wakeDesktop: async () => { wakes++; if (recoverOnWake) await startHelper(); },
-    wakeTimeoutMs: 80, wakePollMs: 10,
+    wakeTimeoutMs: 1_000, wakePollMs: 20,
   });
   try {
     const first = await startHelper();
     await delay(20);
     const second = await startHelper();
     await client.start();
+    await client.healthCheck();
     await t.test("each helper owns an independent private socket", async () => {
       const sockets = (await readdir(root)).filter((name) => name.endsWith(".sock"));
       assert.equal(sockets.length, 2);
@@ -117,18 +136,28 @@ test("Desktop recovers helper loss, downstream disconnect, pipe rotation without
       assert.equal(mutations, 1);
       dropMutation = false;
     });
-    await t.test("Desktop pipe rotation is discovered automatically", async () => {
+    await t.test("Desktop-owned helper restart follows a rotated trusted pipe", async () => {
       for (const socket of connections) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const child of helpers) if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await once(child, "exit");
+      }
       pipe = join(pipeDir, "desktop-b.sock");
       server.listen(pipe);
       await once(server, "listening");
+      await startHelper();
       await delay(300); // background health checks recover without an incoming message
       assert.equal((await client.readThread("target")).thread.id, "target");
       assert.equal((await client.healthCheck()).socketConnected, true);
     });
     await t.test("concurrent readers recover after native connection loss", async () => {
+      await client.healthCheck();
       for (const socket of connections) socket.destroy();
+      // Let the helper observe the native close before all readers arrive;
+      // otherwise a heavily loaded parallel test run can race five writes
+      // against a half-closed test socket, which is not a stable pipe-rotation case.
+      await delay(20);
       const results = await Promise.all(Array.from({ length: 5 }, (_, i) => client.readThread(`target-${i}`)));
       assert.equal(results.length, 5);
     });

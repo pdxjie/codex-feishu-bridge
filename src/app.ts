@@ -32,6 +32,7 @@ import { prepareGuestCodexRuntime } from "./guest/runtime.js";
 import { GuestDesktopSync } from "./guest/desktop-sync.js";
 import type { Logger } from "./logger.js";
 import { findProjectGroup, groupThreadsByProject, UNASSIGNED_PROJECT_ID, type ProjectGroup } from "./projects.js";
+import { taskPresentation, withExecutionDetails, type ResultAction } from "./feishu/streaming-card.js";
 import { StateStore, type GuestThread } from "./store.js";
 
 type PendingApproval = {
@@ -46,8 +47,15 @@ type LiveProgressState = {
   turnId: string;
   chatId: string;
   threadTitle: string;
+  prompt?: string;
+  animationFrame?: number;
+  animationTimer?: NodeJS.Timeout | null;
   messageId: string | null;
+  initialCardReady?: boolean;
   reasoningSummary: string;
+  replyItemId?: string;
+  tools?: Map<string, string>;
+  updateFailures?: number;
   plan: string;
   latestMessage: string;
   activities: string[];
@@ -59,7 +67,8 @@ type LiveProgressState = {
   inFlight: Promise<void> | null;
 };
 
-const LIVE_UPDATE_INTERVAL_MS = 900;
+const LIVE_UPDATE_INTERVAL_MS = 400;
+const LIVE_MOTION_INTERVAL_MS = 1_800;
 const ROLLOUT_POLL_INTERVAL_MS = 400;
 const DESKTOP_SNAPSHOT_INTERVAL_MS = 1_600;
 const GUEST_PROJECT_NAME = "自主排查";
@@ -76,7 +85,7 @@ const GUEST_DEVELOPER_INSTRUCTIONS = `你是企业 ERP 只读问题排查助手�
 跨模块查询只允许已登记能力的受控关联证据；缺少其他业务能力映射时可以继续已授权的源码分析并明确数据未查。不得借用同模块其他页面权限、改写SQL、拆分查询或从源码绕过明确拒绝。库存能力已批准的数据集与页面查询是不同授权路径，不能把任意模块查询包装成库存排查。
 生产查询必须只选择排查所需字段、限制结果数量，并避免输出客户、员工、地址、联系方式、令牌和凭据等敏感数据。
 当且仅当用户明确要求“导出、下载、Excel、CSV 或 Word”时，才可调用导出工具。库存联合排查证据只用 inventory_export_file，不能将其数据改走 export_table_file 借用页面授权。其他模块仍通过 database_export_file 或 export_table_file 的页面授权。默认优先导出 xlsx；不得把敏感字段放入导出文件。导出是受控的结果文件生成，不代表获得项目目录写权限。
-用户要求ERP已有标准导出时，先调用 erp_export_catalog；业务对象、字段、筛选和明细粒度准确匹配后，优先使用 erp_native_export_file。原生导出使用服务认证和本人ERP权限，不要索要密码或Cookie。当前只接入渠道库存列表、采购单商品明细；未接入不能声称ERP没有此功能。服务未部署/配置或权限明确拒绝时如实说明，不得偷偷换成SQL导出来绕过。特殊统计、合并诊断证据等自定义需求继续使用原有受控导出路径。采购原生导出按SKU匹配采购单，可能返回同单其他商品，不能宣称是SKU精确明细。
+用户要求ERP已有的标准导出时，先调用 erp_export_catalog 确认动态发现流程，再用 erp_page_access、project_search 和 project_read_file 从实际源码定位页面、Controller导出路由、Service数据构建方法、表头方法、参数名和字段。不使用业务类型白名单，也不能因为目录未登记就说ERP没有此功能。定位成功后用 erp_native_export_file 提交一次性受控计划；必须复用已有的只读数据构建方法，不能调用创建队列任务、上传、写库或副作用方法。如果源码有导出Controller，但逻辑全部内联在Controller且没有可安全复用的只读Service构建方法，要明确说“已找到ERP导出，但尚无可在只读桥中安全执行的Service构建方法”，不得说ERP没有功能，也不得用SQL伪装原生导出。原生导出使用服务认证、本人ERP页面/路由权限和生产只读账号，不要索要密码或Cookie。只有源码中确实没有对应导出才说“ERP暂无对应原生导出”；权限明确拒绝时说明权限不足。特殊统计、合并诊断证据等ERP本身不存在的自定义需求才使用受控SQL/结果导出。
 如果用户要求写入、修改、绕过权限、读取其他目录或暴露敏感信息，明确拒绝并继续提供只读排查方案。
 结论必须区分“已由数据证实”和“根据代码推断”，不得声称已经实施修复。`;
 
@@ -96,6 +105,11 @@ export class BridgeApp {
   private readonly guestDesktopRegistrations = new Set<string>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly liveProgress = new Map<string, LiveProgressState>();
+  private pendingGuestNotifications = new Map<string, CodexNotification[]>();
+  private resultActions = new Map<string, {
+    openId: string; chatId: string; threadId: string; turnId: string; role: UserRole;
+    prompt: string; kinds: Set<ResultAction['kind']>; expiresAt: number;
+  }>();
   private readonly guestThreadInitializations = new Map<string, Promise<GuestThread>>();
   private guestProjectId: string | null = null;
   private guestDesktopProjectId: string | null = null;
@@ -172,10 +186,14 @@ export class BridgeApp {
       await this.resolveGuestProject();
       this.logger.info("访客只读 Codex 执行器已连接");
     }
-    await this.repairGuestThreadIdentities();
-    await this.migrateGuestThreadsToDesktop();
     this.guestDesktopSync.start();
     await this.feishu.start();
+    // Desktop mirroring is best-effort. Account switching can temporarily
+    // reload its MCP process; Feishu request handling stays online meanwhile.
+    void (async () => {
+      await this.repairGuestThreadIdentities();
+      await this.migrateGuestThreadsToDesktop();
+    })().catch((error) => this.logger.warn("访客 Desktop 后台同步初始化失败，将自动重试", errorDetails(error)));
   }
 
   async stop(): Promise<void> {
@@ -185,6 +203,7 @@ export class BridgeApp {
     for (const progress of this.liveProgress.values()) {
       progress.closed = true;
       if (progress.timer) clearTimeout(progress.timer);
+      if (progress.animationTimer) clearTimeout(progress.animationTimer);
     }
     this.liveProgress.clear();
     this.feishu.stop();
@@ -367,11 +386,14 @@ export class BridgeApp {
       turnId,
       chatId,
       threadTitle: guestThread.title,
+      prompt: text,
+      animationFrame: 0,
+      animationTimer: null,
       messageId: null,
       reasoningSummary: "",
       plan: "",
       latestMessage: "",
-      activities: ["只读任务已提交，正在分析 ERP 源码和允许的数据"],
+      activities: ["小仆虾已接单，正在分析 ERP 源码和允许的数据"],
       startedAt: Date.now(),
       dirty: false,
       closed: false,
@@ -380,8 +402,7 @@ export class BridgeApp {
       inFlight: null,
     };
     this.liveProgress.set(turnId, progress);
-    progress.messageId = await this.feishu.sendCard(chatId, this.liveProgressCard(progress));
-    progress.lastUpdateAt = Date.now();
+    await this.publishInitialProgress(progress);
     void this.refreshGuestThreadInDesktop(threadId, false);
   }
 
@@ -462,8 +483,7 @@ export class BridgeApp {
       !this.guestCodex ||
       !this.guestTools ||
       !this.config.guestWorkspaceRoot ||
-      !this.guestProjectId ||
-      !this.guestDesktopProjectId
+      !this.guestProjectId
     ) {
       throw new Error("访客只读执行器或自主排查项目未就绪。");
     }
@@ -479,6 +499,7 @@ export class BridgeApp {
     await this.guestCodex.setThreadName(created.id, title);
     let desktopManaged = false;
     try {
+      if (!this.guestDesktopProjectId) throw new Error("Codex Desktop 项目仍在后台连接。");
       await this.desktop.registerExternalThread(created.id, this.guestDesktopProjectId);
       desktopManaged = true;
     } catch (error) {
@@ -496,12 +517,13 @@ export class BridgeApp {
       this.guestDesktopRegistrations.add(existing.threadId);
       this.guestDesktopSync.enqueue(existing.threadId);
     }
-    await this.guestDesktopSync.flush();
   }
 
   private async syncGuestThreadToDesktop(threadId: string): Promise<void> {
     const thread = this.store.getGuestThread(threadId);
-    if (!thread || !this.guestCodex || !this.guestProjectId || !this.guestDesktopProjectId) return;
+    if (!thread || !this.guestCodex || !this.guestProjectId) return;
+    await this.resolveGuestDesktopProject();
+    if (!this.guestDesktopProjectId) throw new Error("Codex Desktop 自主排查项目尚未就绪。");
     if (!thread.desktopManaged || this.guestDesktopRegistrations.has(threadId)) {
       await this.guestCodex.setThreadProject(threadId, this.guestProjectId);
       await this.desktop.registerExternalThread(threadId, this.guestDesktopProjectId);
@@ -602,7 +624,7 @@ export class BridgeApp {
   }
 
   private async replaceLockedGuestThread(thread: GuestThread, chatId: string): Promise<GuestThread> {
-    if (!this.guestCodex || !this.guestTools || !this.config.guestWorkspaceRoot || !this.guestProjectId || !this.guestDesktopProjectId) {
+    if (!this.guestCodex || !this.guestTools || !this.config.guestWorkspaceRoot || !this.guestProjectId) {
       throw new Error("访客只读执行器或自主排查项目未就绪。");
     }
     const created = await this.guestCodex.createReadOnlyThread(
@@ -615,6 +637,7 @@ export class BridgeApp {
     await this.guestCodex.setThreadName(created.id, thread.title);
     let desktopManaged = false;
     try {
+      if (!this.guestDesktopProjectId) throw new Error("Codex Desktop 项目仍在后台连接。");
       await this.desktop.registerExternalThread(created.id, this.guestDesktopProjectId);
       desktopManaged = true;
     } catch (error) {
@@ -635,16 +658,6 @@ export class BridgeApp {
 
   private async resolveGuestProject(): Promise<void> {
     if (!this.config.guestWorkspaceRoot) return;
-    const desktopProjects = await this.desktop.listProjects();
-    const desktopProject = desktopProjects.find(
-      (candidate) =>
-        candidate.label === GUEST_PROJECT_NAME &&
-        candidate.path &&
-        resolve(candidate.path) === resolve(this.config.guestWorkspaceRoot!),
-    );
-    if (!desktopProject) {
-      throw new Error(`“${GUEST_PROJECT_NAME}”项目目录必须是 ${this.config.guestWorkspaceRoot}。`);
-    }
     if (!this.guestCodex) throw new Error("访客只读执行器未启用。");
     const guestProjects = await this.guestCodex.listProjects();
     const guestProject =
@@ -659,13 +672,30 @@ export class BridgeApp {
         `codex-feishu-bridge:${GUEST_PROJECT_NAME}:${this.config.guestWorkspaceRoot}`,
       ));
     this.guestProjectId = guestProject.id;
-    this.guestDesktopProjectId = desktopProject.projectId;
+    try {
+      await this.resolveGuestDesktopProject();
+    } catch (error) {
+      this.logger.warn("Codex Desktop 项目暂不可用，访客只读任务先上线并等待后台同步", errorDetails(error));
+    }
     this.logger.info("访客已固定到 Codex 项目", {
-      desktopProjectId: desktopProject.projectId,
+      desktopProjectId: this.guestDesktopProjectId,
       guestExecutionProjectId: guestProject.id,
       projectName: guestProject.name,
       workspace: this.config.guestWorkspaceRoot,
     });
+  }
+
+  private async resolveGuestDesktopProject(): Promise<void> {
+    if (this.guestDesktopProjectId || !this.config.guestWorkspaceRoot) return;
+    const desktopProjects = await this.desktop.listProjects();
+    const desktopProject = desktopProjects.find(
+      (candidate) =>
+        candidate.label === GUEST_PROJECT_NAME &&
+        candidate.path &&
+        resolve(candidate.path) === resolve(this.config.guestWorkspaceRoot!),
+    );
+    if (!desktopProject) throw new Error(`“${GUEST_PROJECT_NAME}”项目目录必须是 ${this.config.guestWorkspaceRoot}。`);
+    this.guestDesktopProjectId = desktopProject.projectId;
   }
 
   private requireOwnedGuestThread(openId: string, threadId: string) {
@@ -801,11 +831,14 @@ export class BridgeApp {
       turnId: taskId,
       chatId,
       threadTitle,
+      prompt: text,
+      animationFrame: 0,
+      animationTimer: null,
       messageId: null,
       reasoningSummary: "",
       plan: "",
       latestMessage: "",
-      activities: ["任务已提交，等待 Codex 输出"],
+      activities: ["小仆虾已接单，正在等待任务开始"],
       startedAt: Date.now(),
       dirty: false,
       closed: false,
@@ -815,10 +848,9 @@ export class BridgeApp {
     };
     this.liveProgress.set(taskId, progress);
     try {
-      progress.messageId = await this.feishu.sendCard(chatId, this.liveProgressCard(progress));
-      progress.lastUpdateAt = Date.now();
+      await this.publishInitialProgress(progress);
       if (!promptAlreadySubmitted) await this.desktop.sendMessage(executionThreadId, text);
-      progress.activities = ["飞书消息已写入 Codex Desktop 同一会话", "等待 Codex 开始处理"];
+      progress.activities = ["小仆虾已把问题送入 Codex Desktop 同一会话", "小仆虾正在等待任务开始"];
       progress.dirty = true;
       this.scheduleLiveProgress(progress);
       void this.monitorDesktopTurn(executionThreadId, taskId, text, baselineTurnIds, rolloutCursor).catch((error) =>
@@ -826,6 +858,8 @@ export class BridgeApp {
       );
     } catch (error) {
       progress.closed = true;
+      if (progress.timer) clearTimeout(progress.timer);
+      if (progress.animationTimer) clearTimeout(progress.animationTimer);
       this.liveProgress.delete(taskId);
       this.activeTurns.delete(executionThreadId);
       throw error;
@@ -936,11 +970,18 @@ export class BridgeApp {
       const view = renderDesktopTurn(turn);
       this.mutateLiveProgress(taskId, (state) => {
         state.turnId = turn.id;
-        if (!state.reasoningSummary) state.reasoningSummary = view.reasoningSummary;
+        if (view.reasoningSummary.length >= state.reasoningSummary.length) state.reasoningSummary = view.reasoningSummary;
         state.plan = view.plan;
-        if (!state.latestMessage) state.latestMessage = view.latestMessage;
+        for (const item of turn.items) {
+          if (!["mcpToolCall", "dynamicToolCall"].includes(item.type) || !item.id) continue;
+          state.tools ??= new Map();
+          const status = item.status === 'failed' ? '❌' : item.status === 'completed' ? '✓' : '◌';
+          state.tools.set(item.id, publicToolStatus(publicToolLabel(item.tool), status === '✓' ? 'completed' : status === '❌' ? 'failed' : 'running'));
+          while (state.tools.size > 16) state.tools.delete(state.tools.keys().next().value!);
+        }
+        if (view.latestMessage && !state.latestMessage.startsWith(view.latestMessage)) state.latestMessage = view.latestMessage;
         for (const activity of view.activities) appendActivity(state.activities, activity);
-        if (state.activities.length === 0) state.activities = ["Codex 正在处理任务"];
+        if (state.activities.length === 0) state.activities = ["小仆虾正在处理任务"];
       });
 
       if (isDesktopTurnTerminal(turn.status)) {
@@ -965,7 +1006,7 @@ export class BridgeApp {
         else if (!state.latestMessage.includes(update.text)) {
           state.latestMessage = appendLimited(state.latestMessage, `${state.latestMessage ? "\n\n" : ""}${update.text}`, 7_000);
         }
-        appendActivity(state.activities, update.phase === "final_answer" ? "最终回复已生成" : "公开进度已更新");
+        appendActivity(state.activities, update.phase === "final_answer" ? "小仆虾已经生成最终回复" : "小仆虾更新了公开进度");
       } else if (update.kind === "reasoning_summary") {
         if (!state.reasoningSummary.includes(update.text)) {
           state.reasoningSummary = appendLimited(
@@ -974,13 +1015,13 @@ export class BridgeApp {
             6_000,
           );
         }
-        appendActivity(state.activities, "公开思考摘要已更新");
+        appendActivity(state.activities, "小仆虾更新了分析摘要");
       } else if (update.kind === "activity") {
         appendActivity(state.activities, update.text, true);
       } else if (update.kind === "task_started") {
-        appendActivity(state.activities, "Codex 已开始处理");
+        appendActivity(state.activities, "小仆虾正式开工啦");
       } else if (update.kind === "task_complete") {
-        appendActivity(state.activities, "Codex 已完成处理，正在同步最终结果");
+        appendActivity(state.activities, "小仆虾已经查完，正在把结果端上来");
       }
     });
   }
@@ -996,24 +1037,16 @@ export class BridgeApp {
     if (!route || !progress) return;
     progress.closed = true;
     if (progress.timer) clearTimeout(progress.timer);
+    if (progress.animationTimer) clearTimeout(progress.animationTimer);
     progress.timer = null;
-    if (progress.inFlight) await progress.inFlight;
+    progress.animationTimer = null;
+    if (progress.inFlight) await progress.inFlight.catch(() => undefined);
     this.liveProgress.delete(taskId);
-    this.activeTurns.delete(threadId);
-
     const failed = turn.status !== "completed";
-    const content = finalText || turn.error?.message || `任务状态：${turn.status}`;
-    if (progress.messageId) {
-      try {
-        await this.feishu.updateCard(
-          progress.messageId,
-          threadResultCard(progress.threadTitle, "任务已结束，最终结果已在新消息中推送。", failed),
-        );
-      } catch (error) {
-        this.logger.warn("更新 Desktop 实时进度卡片的最终状态失败", errorDetails(error));
-      }
-    }
-    await this.feishu.sendCard(route.chatId, threadResultCard(progress.threadTitle, content, failed));
+    const content = completedResultText(finalText, progress.latestMessage) ??
+      nonBlankText(turn.error?.message) ?? `任务状态：${turn.status}`;
+    try { await this.deliverResult(route.chatId, progress.threadTitle, content, failed, progress); }
+    finally { if (this.activeTurns.get(threadId) === turn.id) this.activeTurns.delete(threadId); }
   }
 
   private async failDesktopMonitor(threadId: string, taskId: string, error: unknown): Promise<void> {
@@ -1023,12 +1056,13 @@ export class BridgeApp {
     if (!progress || !route) return;
     progress.closed = true;
     if (progress.timer) clearTimeout(progress.timer);
+    if (progress.animationTimer) clearTimeout(progress.animationTimer);
+    progress.timer = null;
+    progress.animationTimer = null;
+    if (progress.inFlight) await progress.inFlight.catch(() => undefined);
     this.liveProgress.delete(taskId);
     this.logger.error("Codex Desktop 实时同步中断", errorDetails(error));
-    await this.feishu.sendCard(
-      route.chatId,
-      threadResultCard(progress.threadTitle, `实时同步中断：${errorMessage(error)}`, true),
-    );
+    await this.deliverResult(route.chatId, progress.threadTitle, `实时同步中断：${errorMessage(error)}`, true, progress);
   }
 
   private async stopCurrentTurn(openId: string, chatId: string): Promise<void> {
@@ -1039,6 +1073,14 @@ export class BridgeApp {
     await this.feishu.sendText(chatId, "已发送停止请求。");
   }
 
+  private resolveCardTurnId(threadId: string, id: string): string {
+    if (!id.startsWith("desktop-")) return id;
+    const progress = this.liveProgress.get(id);
+    if (!progress || progress.threadId !== threadId || progress.closed) throw new Error("该任务已结束。");
+    if (progress.turnId.startsWith("desktop-")) throw new Error("任务尚未开始，请稍后停止。");
+    return progress.turnId;
+  }
+
   private async onCardAction(action: CardAction): Promise<void> {
     const role = this.resolveRoleForOpenId(action.openId);
     if (!role) {
@@ -1047,10 +1089,14 @@ export class BridgeApp {
     }
     const actionName = stringValue(action.value.action);
     try {
+      if (actionName === "result_followup") {
+        await this.handleResultFollowup(action, role);
+        return;
+      }
       if (role === "guest") {
         if (actionName === "stop_turn") {
           const threadId = requiredString(action.value.threadId, "会话 ID");
-          const turnId = requiredString(action.value.turnId, "Turn ID");
+          const turnId = this.resolveCardTurnId(threadId, requiredString(action.value.turnId, "Turn ID"));
           this.requireOwnedGuestThread(action.openId, threadId);
           if (!this.guestCodex) throw new Error("访客只读执行器未启用。");
           await this.guestCodex.interruptTurn(threadId, turnId);
@@ -1083,7 +1129,7 @@ export class BridgeApp {
       }
       if (actionName === "stop_turn") {
         const threadId = requiredString(action.value.threadId, "会话 ID");
-        const turnId = requiredString(action.value.turnId, "Turn ID");
+        const turnId = this.resolveCardTurnId(threadId, requiredString(action.value.turnId, "Turn ID"));
         await this.codex.interruptTurn(threadId, turnId);
         await this.feishu.sendText(action.chatId, "已发送停止请求。");
         return;
@@ -1104,6 +1150,20 @@ export class BridgeApp {
 
   private onCodexNotification(notification: CodexNotification): void {
     const params = notification.params ?? {};
+    // A turn can emit tokens/tools (or even finish) before its initial card is sent.
+    // Keep those public events until the card has a message ID.
+    if (notification.method === "item/reasoning/textDelta") return;
+    const incomingTurn = stringValue(params.turnId) ?? (isRecord(params.turn) ? stringValue(params.turn.id) : null);
+    const incomingThread = stringValue(params.threadId);
+    const waiting = incomingTurn ? this.liveProgress.get(incomingTurn) : undefined;
+    if (incomingTurn && ((waiting && !waiting.messageId && !waiting.closed && !waiting.initialCardReady) ||
+      (incomingThread && this.activeTurns.get(incomingThread)?.startsWith("guest-starting-")))) {
+      this.pendingGuestNotifications ??= new Map();
+      const queue = this.pendingGuestNotifications.get(incomingTurn) ?? [];
+      queue.push(notification);
+      this.pendingGuestNotifications.set(incomingTurn, queue.slice(-200));
+      return;
+    }
     this.handleLiveProgressNotification(notification.method, params);
     if (notification.method === "item/agentMessage/delta") {
       const turnId = stringValue(params.turnId);
@@ -1132,23 +1192,28 @@ export class BridgeApp {
     if (!turn || typeof turn.id !== "string") return;
 
     const route = this.store.getTurnRoute(threadId);
-    this.activeTurns.delete(threadId);
-    if (!route) return;
+    if (!route) {
+      if (this.activeTurns.get(threadId) === turn.id) this.activeTurns.delete(threadId);
+      return;
+    }
     if (route.role === "guest") this.store.touchGuestThread(threadId);
 
     const progress = this.liveProgress.get(turn.id);
     if (progress) {
       progress.closed = true;
       if (progress.timer) clearTimeout(progress.timer);
+      if (progress.animationTimer) clearTimeout(progress.animationTimer);
       progress.timer = null;
-      if (progress.inFlight) await progress.inFlight;
+      progress.animationTimer = null;
+      if (progress.inFlight) await progress.inFlight.catch(() => undefined);
       this.liveProgress.delete(turn.id);
     }
 
+    const completedItemText = turn.items
+      ?.findLast((item) => item.type === "agentMessage" && typeof item.text === "string")?.text;
     const finalText =
-      this.finalMessages.get(turn.id) ??
-      turn.items?.findLast((item) => item.type === "agentMessage" && typeof item.text === "string")?.text ??
-      turn.error?.message ??
+      completedResultText(completedItemText, this.finalMessages.get(turn.id), progress?.latestMessage) ??
+      nonBlankText(turn.error?.message) ??
       `任务状态：${turn.status}`;
     this.finalMessages.delete(turn.id);
     const failed = turn.status !== "completed";
@@ -1156,27 +1221,85 @@ export class BridgeApp {
       progress?.threadTitle ||
       (route.role === "guest" ? this.store.getGuestThread(threadId)?.title : null) ||
       (await this.readThreadTitle(threadId));
-    if (progress?.messageId) {
-      try {
-        await this.feishu.updateCard(
-          progress.messageId,
-          threadResultCard(threadTitle, "任务已结束，最终结果已在新消息中推送。", failed),
-        );
-      } catch (error) {
-        this.logger.warn("更新 Codex 实时进度卡片的最终状态失败", errorDetails(error));
-      }
-    }
     try {
-      await this.feishu.sendCard(route.chatId, threadResultCard(threadTitle, finalText, failed));
+      await this.deliverResult(route.chatId, threadTitle, finalText, failed, progress);
       if (route.role === "guest") await this.sendGuestExportFiles(route.chatId, turn.id);
     } finally {
-      if (route.role === "guest") {
-        await this.guestCodex?.unsubscribeThread(threadId).catch((error) =>
-          this.logger.warn("释放已完成的访客会话写入锁失败", errorDetails(error)),
-        );
-        await this.refreshGuestThreadInDesktop(threadId, true);
+      // Clear the completed turn before refreshing Desktop. Otherwise the
+      // refresh still renders the thread as running and no later event exists
+      // to restore its idle title.
+      if (this.activeTurns.get(threadId) === turn.id) this.activeTurns.delete(threadId);
+      try {
+        if (route.role === "guest") {
+          await this.guestCodex?.unsubscribeThread(threadId).catch((error) =>
+            this.logger.warn("释放已完成的访客会话写入锁失败", errorDetails(error)),
+          );
+          await this.refreshGuestThreadInDesktop(threadId, true);
+        }
+      } finally {
+        // Keep cleanup idempotent if a future refactor exits before the first
+        // delete, while never deleting a newer turn on the same thread.
+        if (this.activeTurns.get(threadId) === turn.id) this.activeTurns.delete(threadId);
       }
     }
+  }
+
+  private async deliverResult(chatId: string, title: string, content: string, failed: boolean, progress?: LiveProgressState): Promise<void> {
+    const base = threadResultCard(title, content, failed);
+    const card = progress ? withExecutionDetails(base, {
+      threadTitle: title, reasoningSummary: progress.reasoningSummary, plan: progress.plan,
+      ...(progress.prompt ? { prompt: progress.prompt } : {}),
+      activities: progress.activities.slice(-4), toolActivities: [...(progress.tools?.values() ?? [])],
+      startedAt: progress.startedAt,
+      elapsedSeconds: Math.max(0, Math.floor((Date.now() - progress.startedAt) / 1000)),
+    }, { content, failed, actions: this.registerResultActions(progress, content, failed) }) : base;
+    if (progress?.messageId) {
+      try {
+        await this.feishu.updateCard(progress.messageId, card);
+        return;
+      } catch (error) { this.logger.warn("原卡片完成更新失败，发送结果兜底卡片", errorDetails(error)); }
+    }
+    await this.feishu.sendCard(chatId, card);
+  }
+
+  private registerResultActions(progress: LiveProgressState, content: string, failed: boolean): ResultAction[] {
+    if (failed || !progress.prompt || /权限不足|无权访问|暂无法确认数据授权范围|拒绝访问/.test(content)) return [];
+    const route = this.store.getTurnRoute(progress.threadId);
+    if (!route?.openId || !route.turnId) return [];
+    const presentation = taskPresentation(progress.prompt);
+    const kinds: ResultAction['kind'][] = [
+      ...(presentation.canExport ? ['export' as const] : []),
+      ...(presentation.canInvestigate ? ['investigate' as const] : []),
+    ];
+    if (!kinds.length) return [];
+    this.resultActions ??= new Map();
+    for (const [token, entry] of this.resultActions) if (entry.expiresAt <= Date.now()) this.resultActions.delete(token);
+    while (this.resultActions.size >= 1000) this.resultActions.delete(this.resultActions.keys().next().value!);
+    const token = randomUUID();
+    this.resultActions.set(token, { openId: route.openId, chatId: route.chatId, threadId: progress.threadId,
+      turnId: route.turnId, role: route.role, prompt: progress.prompt, kinds: new Set(kinds), expiresAt: Date.now() + 24 * 60 * 60_000 });
+    return kinds.map(kind => ({ kind, token }));
+  }
+
+  private async handleResultFollowup(action: CardAction, role: UserRole): Promise<void> {
+    const token = requiredString(action.value.token, '操作凭据');
+    const entry = this.resultActions?.get(token);
+    if (!entry || entry.expiresAt <= Date.now()) throw new Error('此操作已过期，请在聊天中直接发送需求。');
+    if (entry.openId !== action.openId || entry.chatId !== action.chatId || entry.role !== role) throw new Error('无权操作其他人的结果卡片。');
+    const kind = action.value.kind;
+    if ((kind !== 'export' && kind !== 'investigate') || !entry.kinds.has(kind)) throw new Error('无效或已使用的结果操作。');
+    const currentThreadId = role === 'guest' ? this.store.getGuestThreadForUser(action.openId)?.threadId : this.store.getUser(action.openId)?.activeThreadId;
+    const route = this.store.getTurnRoute(entry.threadId);
+    if (currentThreadId !== entry.threadId || route?.turnId !== entry.turnId) throw new Error('会话或问题已更新，请在当前聊天中说明要继续处理的范围。');
+    if (this.activeTurns.has(entry.threadId)) throw new Error('当前会话已有任务，请等待完成后继续。');
+    // Consume before the first await: duplicate clicks cannot submit twice.
+    entry.kinds.clear();
+    const prompt = `针对以下原问题继续处理，保持其业务对象和筛选范围；若范围仍不明确，请先澄清。\n\n原问题：\n${entry.prompt}\n\n` +
+      (kind === 'export'
+        ? '请导出本次查询范围内的明细，并通过飞书发送文件。重新核验当前用户的数据和导出权限，沿用现有受控导出流程；不要扩大范围或绕过授权。'
+        : '请继续只读追查原因，优先核实尚未确认的关联记录，区分数据证实与代码推断，不执行修复或任何写操作。');
+    if (role === 'guest') await this.submitGuestPrompt(action.openId, action.chatId, prompt);
+    else await this.submitPrompt(action.openId, action.chatId, prompt);
   }
 
   private async sendGuestExportFiles(chatId: string, turnId: string): Promise<void> {
@@ -1215,13 +1338,21 @@ export class BridgeApp {
 
     if (method === "item/reasoning/summaryTextDelta") {
       const delta = stringValue(params.delta);
-      if (delta) this.mutateLiveProgress(turnId, (state) => (state.reasoningSummary = appendLimited(state.reasoningSummary, delta, 6_000)));
+      if (delta) this.mutateLiveProgress(turnId, (state) => (state.reasoningSummary = (state.reasoningSummary + delta).slice(0, 6_000)));
       return;
     }
     // item/reasoning/textDelta 是模型的原始隐式思维，不转发；只展示公开 reasoning summary。
     if (method === "item/agentMessage/delta") {
       const delta = stringValue(params.delta);
-      if (delta) this.mutateLiveProgress(turnId, (state) => (state.latestMessage = appendLimited(state.latestMessage, delta, 7_000)));
+      if (delta) this.mutateLiveProgress(turnId, (state) => {
+        const itemId = stringValue(params.itemId);
+        if (itemId && state.replyItemId !== itemId) {
+          state.replyItemId = itemId;
+          state.latestMessage = "";
+          this.finalMessages.delete(turnId);
+        }
+        state.latestMessage = (state.latestMessage + delta).slice(0, 16000);
+      });
       return;
     }
     if (method === "item/plan/delta") {
@@ -1235,14 +1366,24 @@ export class BridgeApp {
       return;
     }
     if (method === "item/mcpToolCall/progress") {
-      const message = stringValue(params.message);
-      this.addLiveActivity(turnId, message ? `工具进度：${truncateText(message, 240)}` : "工具正在运行");
+      this.addLiveActivity(turnId, "小仆虾正在等查证工具返回结果");
       return;
     }
-    if (method === "item/started" || method === "item/completed") {
+    if (["item/started", "item/completed", "bridge/tool/started", "bridge/tool/completed"].includes(method)) {
       const item = isRecord(params.item) ? params.item : null;
       if (!item) return;
-      const activity = describeItem(item, method === "item/completed");
+      const completed = method.endsWith("/completed");
+      if (["dynamicToolCall", "mcpToolCall"].includes(String(item.type))) {
+        const label = publicToolLabel(item.tool);
+        const id = stringValue(item.id) ?? label;
+        this.mutateLiveProgress(turnId, state => {
+          state.tools ??= new Map();
+          state.tools.set(id, publicToolStatus(label, completed ? item.status === "failed" ? "failed" : "completed" : "running"));
+          while (state.tools.size > 16) state.tools.delete(state.tools.keys().next().value!);
+        });
+        return;
+      }
+      const activity = describeItem(item, completed);
       if (activity) this.addLiveActivity(turnId, activity);
     }
   }
@@ -1262,10 +1403,42 @@ export class BridgeApp {
     if (state.messageId) this.scheduleLiveProgress(state);
   }
 
+  private async publishInitialProgress(state: LiveProgressState): Promise<void> {
+    try {
+      state.messageId = await this.feishu.sendCard(state.chatId, this.liveProgressCard(state));
+    } catch (error) {
+      this.logger.warn("首张进度卡片发送失败，继续任务并在结束时推送结果", errorDetails(error));
+    }
+    state.initialCardReady = true;
+    state.lastUpdateAt = Date.now();
+    const pending = this.pendingGuestNotifications?.get(state.turnId) ?? [];
+    this.pendingGuestNotifications?.delete(state.turnId);
+    for (const notification of pending) this.onCodexNotification(notification);
+    if (!state.closed && state.messageId) {
+      state.dirty = true;
+      this.scheduleLiveProgress(state);
+      this.scheduleLiveMotion(state);
+    }
+  }
+
+  private scheduleLiveMotion(state: LiveProgressState): void {
+    if (state.closed || state.animationTimer || !state.messageId) return;
+    state.animationTimer = setTimeout(() => {
+      state.animationTimer = null;
+      if (state.closed || !state.messageId) return;
+      state.animationFrame = ((state.animationFrame ?? 0) + 1) % 6;
+      state.dirty = true;
+      this.scheduleLiveProgress(state);
+      this.scheduleLiveMotion(state);
+    }, LIVE_MOTION_INTERVAL_MS);
+    state.animationTimer.unref();
+  }
+
   private scheduleLiveProgress(state: LiveProgressState): void {
     if (state.closed || state.timer || state.inFlight || !state.messageId) return;
     const elapsed = Date.now() - state.lastUpdateAt;
-    const delay = Math.max(0, LIVE_UPDATE_INTERVAL_MS - elapsed);
+    const interval = Math.min(10_000, LIVE_UPDATE_INTERVAL_MS * 2 ** (state.updateFailures ?? 0));
+    const delay = Math.max(0, interval - elapsed);
     state.timer = setTimeout(() => {
       state.timer = null;
       void this.flushLiveProgress(state);
@@ -1281,7 +1454,11 @@ export class BridgeApp {
     try {
       await update;
       state.lastUpdateAt = Date.now();
+      state.updateFailures = 0;
     } catch (error) {
+      state.lastUpdateAt = Date.now();
+      state.updateFailures = Math.min(5, (state.updateFailures ?? 0) + 1);
+      state.dirty = true;
       this.logger.warn("推送 Codex 实时进度失败", errorDetails(error));
     } finally {
       state.inFlight = null;
@@ -1292,10 +1469,14 @@ export class BridgeApp {
   private liveProgressCard(state: LiveProgressState): Record<string, unknown> {
     return runningCard(state.threadId, state.turnId, {
       threadTitle: state.threadTitle,
+      ...(state.prompt ? { prompt: state.prompt } : {}),
+      animationFrame: state.animationFrame ?? 0,
       reasoningSummary: state.reasoningSummary,
       plan: state.plan,
       latestMessage: state.latestMessage,
-      activities: state.activities,
+      activities: state.activities.slice(-3),
+      toolActivities: [...(state.tools?.values() ?? [])],
+      startedAt: state.startedAt,
       elapsedSeconds: Math.max(0, Math.floor((Date.now() - state.startedAt) / 1_000)),
     });
   }
@@ -1437,17 +1618,22 @@ export function renderRolloutEvent(event: DesktopRolloutEvent): RolloutProgressU
     const summary = publicReasoningSummary(payload.summary).join("\n").trim();
     return summary ? { kind: "reasoning_summary", text: summary } : null;
   }
+  if (outerType === "response_item" && ["custom_tool_call", "function_call"].includes(String(payload.type))) {
+    return { kind: "activity", text: publicToolStatus(publicToolLabel(payload.name), "running") };
+  }
   if (outerType !== "event_msg") return null;
 
   const eventType = stringValue(payload.type);
   const turnId = stringValue(payload.turn_id) ?? undefined;
   if (eventType === "task_started") return { kind: "task_started", ...(turnId ? { turnId } : {}) };
   if (eventType === "task_complete") return { kind: "task_complete", ...(turnId ? { turnId } : {}) };
-  if (eventType !== "item_completed" || !isRecord(payload.item)) return null;
+  if (!["item_started", "item_completed"].includes(eventType ?? "") || !isRecord(payload.item)) return null;
+  const completed = eventType === "item_completed";
 
   const item = payload.item;
   switch (item.type) {
     case "AgentMessage": {
+      if (!completed) return null;
       const text = rolloutTextContent(item.content);
       if (!text) return null;
       return {
@@ -1457,10 +1643,12 @@ export function renderRolloutEvent(event: DesktopRolloutEvent): RolloutProgressU
       };
     }
     case "Reasoning": {
+      if (!completed) return { kind: "activity", text: "正在分析问题" };
       const summary = publicReasoningSummary(item.summary).join("\n").trim();
       return summary ? { kind: "reasoning_summary", text: summary } : { kind: "activity", text: "分析阶段已完成" };
     }
     case "CommandExecution": {
+      if (!completed) return { kind: "activity", text: "正在执行命令" };
       const status = stringValue(item.status);
       const exitCode = typeof item.exit_code === "number" ? item.exit_code : null;
       return status === "failed"
@@ -1470,7 +1658,8 @@ export function renderRolloutEvent(event: DesktopRolloutEvent): RolloutProgressU
     case "FileChange":
       return { kind: "activity", text: item.status === "failed" ? "❌ 文件修改失败" : "✅ 文件修改已完成" };
     case "McpToolCall":
-      return { kind: "activity", text: item.status === "failed" ? "❌ 工具调用失败" : "✅ 工具调用已完成" };
+    case "DynamicToolCall":
+      return { kind: "activity", text: publicToolStatus(publicToolLabel(item.tool), completed ? item.status === "failed" ? "failed" : "completed" : "running") };
     case "ImageView":
       return { kind: "activity", text: "图像已读取" };
     case "ContextCompaction":
@@ -1503,6 +1692,28 @@ function truncateText(text: string, limit: number): string {
   return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}…`;
 }
 
+function nonBlankText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const cleaned = value.trim();
+  return cleaned ? cleaned : null;
+}
+
+// Completion events and Desktop snapshots may arrive before their final text
+// is fully persisted. Prefer an explicit final answer, but let the last public
+// stream extend it when both are the same prefix. This guarantees that text
+// already shown to the user is never replaced by an empty completion card.
+function completedResultText(...candidates: unknown[]): string | null {
+  let selected: string | null = null;
+  for (const candidate of candidates) {
+    const text = nonBlankText(candidate);
+    if (!text) continue;
+    if (!selected || text.startsWith(selected)) selected = text;
+    else if (selected.startsWith(text)) continue;
+    // Distinct lower-priority commentary must not replace an explicit final answer.
+  }
+  return selected;
+}
+
 function renderPlan(value: unknown): string | null {
   if (!Array.isArray(value)) return null;
   const lines = value.flatMap((entry) => {
@@ -1524,6 +1735,7 @@ function describeItem(item: Record<string, unknown>, completed: boolean): string
     }
     case "fileChange":
       return completed ? "文件修改已处理" : "正在准备文件修改";
+    case "dynamicToolCall":
     case "mcpToolCall": {
       const server = stringValue(item.server);
       const tool = stringValue(item.tool);
@@ -1600,11 +1812,11 @@ export function renderDesktopTurn(turn: DesktopTurnSnapshot): {
   }
 
   const finalText = finalAnswers.at(-1) ?? (isDesktopTurnTerminal(turn.status) ? commentary.at(-1) : "") ?? "";
-  const latestMessage = commentary.at(-1) ?? (finalAnswers.at(-1) ?? "");
+  const latestMessage = finalAnswers.at(-1) ?? commentary.at(-1) ?? "";
   return {
     reasoningSummary: appendLimited("", publicSummaries.join("\n"), 6_000),
     plan: appendLimited("", plans.at(-1) ?? "", 4_000),
-    latestMessage: appendLimited("", latestMessage, 7_000),
+    latestMessage: latestMessage.slice(0, 16000),
     activities: activities.slice(-20),
     finalText,
   };
@@ -1657,4 +1869,29 @@ function delay(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref();
   });
+}
+
+
+function publicToolLabel(value: unknown): string {
+  const name = typeof value === "string" && /^[A-Za-z0-9_.:/-]{1,100}$/.test(value) ? value : "tool";
+  const labels: Record<string, string> = {
+    erp_access_profile: "核验业务权限", erp_page_access: "核对页面权限", project_search: "检索项目代码",
+    project_read_file: "阅读项目代码", project_list_directory: "定位项目文件", database_query: "查询只读数据",
+    database_describe_table: "核对数据结构", database_explain: "检查查询计划", database_list_connections: "检查只读连接",
+    inventory_case_open: "建立关联排查", inventory_diagnose: "查询库存证据", inventory_export_file: "导出排查证据",
+    database_export_file: "生成数据文件", erp_native_export_file: "执行ERP原生导出", export_table_file: "生成结果文件",
+    erp_export_catalog: "检查导出能力",
+  };
+  if (labels[name]) return labels[name];
+  if (/search|find/i.test(name)) return "检索相关资料";
+  if (/read|fetch|get/i.test(name)) return "读取相关资料";
+  if (/database|sql|query/i.test(name)) return "查询只读数据";
+  if (/export|file/i.test(name)) return "整理结果文件";
+  return "执行受控操作";
+}
+
+function publicToolStatus(label: string, status: "running" | "completed" | "failed"): string {
+  if (status === "completed") return `✓ 小仆虾已完成：${label}`;
+  if (status === "failed") return `❌ 小仆虾遇到阻碍：${label}`;
+  return `◌ 小仆虾正在${label}`;
 }

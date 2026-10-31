@@ -22,7 +22,7 @@ export function prepareGuestCodexRuntime(guestCodexHome: string): GuestCodexRunt
     args: [
       "app-server",
       "--stdio",
-      ...extractMcpServerNames(sourceConfig).flatMap((name) => ["-c", `mcp_servers.${name}.enabled=false`]),
+      ...disabledMcpOverrides(sourceConfig),
       "--disable",
       "shell_tool",
       "--disable",
@@ -57,7 +57,22 @@ export function prepareGuestCodexRuntime(guestCodexHome: string): GuestCodexRunt
   };
 }
 
-function extractMcpServerNames(source: string): string[] {
-  const names = [...source.matchAll(/^\s*\[mcp_servers\.([A-Za-z0-9_-]+)\]\s*$/gm)].map((match) => match[1]!);
-  return [...new Set(names)];
+export function disabledMcpOverrides(source: string): string[] {
+  const overrides = new Map<string, string>();
+  const sections = [...source.matchAll(/^\s*\[mcp_servers\.([A-Za-z0-9_-]+|"[A-Za-z0-9_-]+"|'[A-Za-z0-9_-]+')\][ \t]*(?:#.*)?$/gm)];
+  for (const section of sections) {
+    const name = section[1]!.replace(/^["']|["']$/g, '');
+    const rest = source.slice(section.index! + section[0].length);
+    const next = rest.search(/^\s*\[/m);
+    const body = next < 0 ? rest : rest.slice(0, next);
+    // Codex reloads config for requests. After account/config switching the
+    // original server may disappear, leaving an enabled=false-only invalid
+    // transport. Keep a complete, disabled transport in the process override.
+    // No original commands, arguments, credentials or endpoints are copied.
+    const transport = /^\s*url\s*=/m.test(body)
+      ? 'url="http://127.0.0.1:9/disabled-mcp"'
+      : 'command="/usr/bin/false"';
+    overrides.set(name, `mcp_servers.${name}={enabled=false,${transport}}`);
+  }
+  return [...overrides.values()].flatMap(value => ['-c', value]);
 }

@@ -192,3 +192,114 @@ test("飞书导出文件先上传再作为文件消息发送", async () => {
     { method: "message", msgType: "file", content: JSON.stringify({ file_key: "file_test" }) },
   ]);
 });
+
+test("原生流式卡片只更新变化文本，序号串行递增，并在原卡片结束流式", async () => {
+  const { runningCard, threadResultCard } = await import('../src/feishu/cards.js');
+  const client = new FeishuClient('test-app', 'test-secret', new Logger('error'));
+  const calls: Array<{ method: string; data?: any; path?: any }> = [];
+  (client as any).api = {
+    cardkit: { v1: {
+      card: {
+        create: async (p: any) => { calls.push({ method: 'create', ...p }); return { code: 0, data: { card_id: 'card-1' } }; },
+        settings: async (p: any) => { calls.push({ method: 'settings', ...p }); return { code: 0 }; },
+        update: async (p: any) => { calls.push({ method: 'final', ...p }); return { code: 0 }; },
+      },
+      cardElement: { content: async (p: any) => { calls.push({ method: 'text', ...p }); return { code: 0 }; } },
+    } },
+    im: { message: {
+      create: async (p: any) => { calls.push({ method: 'send', ...p }); return { code: 0, data: { message_id: 'message-1' } }; },
+      patch: async () => { throw new Error('native stream must not replace the whole message'); },
+    } },
+  };
+  const view = { threadTitle: '测试会话', latestMessage: '已' };
+  const id = await client.sendCard('chat-test', runningCard('t', 'turn', view));
+  assert.equal(JSON.parse(calls.find(c => c.method === 'send')!.data.content).data.card_id, 'card-1');
+  await Promise.all([
+    client.updateCard(id, runningCard('t', 'turn', { ...view, latestMessage: '已查到' })),
+    client.updateCard(id, runningCard('t', 'turn', { ...view, latestMessage: '已查到库存结果' })),
+  ]);
+  await client.updateCard(id, runningCard('t', 'turn', { ...view, latestMessage: '已查到库存结果' }));
+  assert.deepEqual(calls.filter(c => c.method === 'text').map(c => [c.path.element_id, c.data.content, c.data.sequence]), [
+    ['reply', '已查到', 1], ['reply', '已查到库存结果', 2],
+  ]);
+  await client.updateCard(id, threadResultCard('测试会话', '最终结果'));
+  assert.deepEqual(calls.filter(c => ['settings', 'final'].includes(c.method)).map(c => [c.method, c.data.sequence]), [['settings', 3], ['final', 4]]);
+  assert.equal(JSON.parse(calls.find(c => c.method === 'settings')!.data.settings).config.streaming_mode, false);
+  assert.equal((client as any).streams.size, 0);
+  assert.equal(calls.filter(c => c.method === 'send').length, 1);
+});
+
+test("CardKit不可用时普通卡片仍可用，业务错误不能伪装更新成功", async () => {
+  const { runningCard } = await import('../src/feishu/cards.js');
+  const client = new FeishuClient('test-app', 'test-secret', new Logger('error'));
+  let creates = 0; let sent = ''; let patchCode = 1234;
+  (client as any).api = {
+    cardkit: { v1: { card: { create: async () => { creates++; return { code: 99991672 }; } } } },
+    im: { message: {
+      create: async (p: any) => { sent = p.data.content; return { code: 0, data: { message_id: 'm' } }; },
+      patch: async () => ({ code: patchCode }),
+    } },
+  };
+  const card = runningCard('t', 'turn');
+  await client.sendCard('chat', card); await client.sendCard('chat', card);
+  assert.equal(creates, 1);
+  assert.equal(JSON.parse(sent).config.streaming_mode, false);
+  await assert.rejects(client.updateCard('m', card), /1234/);
+  patchCode = 0;
+  await client.updateCard('m', card);
+});
+
+test("连续流式更新失败会降级同一消息，保留完整最新内容", async () => {
+  const { runningCard } = await import('../src/feishu/cards.js');
+  const client = new FeishuClient('test-app', 'test-secret', new Logger('error'));
+  let patched: any;
+  (client as any).api = {
+    cardkit: { v1: {
+      card: { create: async () => ({ code: 0, data: { card_id: 'c' } }) },
+      cardElement: { content: async () => ({ code: 429 }) },
+    } },
+    im: { message: {
+      create: async () => ({ code: 0, data: { message_id: 'm' } }),
+      patch: async (p: any) => { patched = JSON.parse(p.data.content); return { code: 0 }; },
+    } },
+  };
+  await client.sendCard('chat', runningCard('t', 'turn'));
+  const update = runningCard('t', 'turn', { threadTitle: '测试', latestMessage: '完整最新回复' });
+  await assert.rejects(client.updateCard('m', update), /429/);
+  await assert.rejects(client.updateCard('m', update), /429/);
+  await client.updateCard('m', update);
+  assert.match(JSON.stringify(patched), /完整最新回复/);
+  assert.equal(patched.config.streaming_mode, false);
+  assert.equal((client as any).streams.size, 0);
+});
+
+test('新增列内进度和分析动态使用局部流式更新，不重建组件', async () => {
+  const { runningCard } = await import('../src/feishu/cards.js');
+  const client = new FeishuClient('test-app', 'test-secret', new Logger('error'));
+  const updates: string[] = [];
+  (client as any).api = {
+    cardkit: { v1: {
+      card: { create: async () => ({ code: 0, data: { card_id: 'c' } }) },
+      cardElement: { content: async (p: any) => { updates.push(p.path.element_id); return { code: 0 }; } },
+    } },
+    im: { message: {
+      create: async () => ({ code: 0, data: { message_id: 'm' } }),
+      patch: async () => { throw new Error('must not patch entire card'); },
+    } },
+  };
+  const view = { threadTitle: '测试', prompt: '查询库存', latestMessage: '' };
+  await client.sendCard('chat', runningCard('t', 'turn', view));
+  const nextView = { ...view, latestMessage: '正在整理结果', elapsedSeconds: 10,
+    reasoningSummary: '已核对公开来源', toolActivities: ['✓ 查询只读数据 · database_query · 完成'] };
+  const next = runningCard('t', 'turn', nextView);
+  await client.updateCard('m', next);
+  assert.equal(updates[0], 'reply');
+  for (const key of ['signal', 'status', 'stage_flow', 'analysis_preview', 'activity', 'reasoning']) assert.ok(updates.includes(key), key);
+  assert.ok(!updates.includes('request') && !updates.includes('started_at'));
+  const count = updates.length;
+  await client.updateCard('m', next);
+  assert.equal(updates.length, count);
+  updates.length = 0;
+  await client.updateCard('m', runningCard('t', 'turn', { ...nextView, animationFrame: 1 }));
+  assert.deepEqual(updates, ['motion'], 'animation frames must update only the lightweight status element');
+});

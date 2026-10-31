@@ -7,7 +7,7 @@ import type { DynamicToolCall } from "../codex/client.js";
 import type { Logger } from "../logger.js";
 import type { ErpAccessContext } from "./erp-access-control.js";
 import type { GuestExportFile } from "./export-files.js";
-import { boundedText, exportRequest, NATIVE_EXPORT_CATALOG, validateNativeExport, type NativeExportConfig, type NativeExportRequest } from "./native-export-protocol.js";
+import { boundedText, exportRequest, validateNativeExport, type NativeExportConfig, type NativeExportRequest } from "./native-export-protocol.js";
 
 export class NativeExportManager {
   private readonly filesByTurn = new Map<string, Map<string, GuestExportFile>>();
@@ -17,19 +17,20 @@ export class NativeExportManager {
   constructor(private readonly root: string, private readonly config: NativeExportConfig | undefined, private readonly logger: Logger) {}
 
   catalog() {
-    return { configured: Boolean(this.config), exports: NATIVE_EXPORT_CATALOG, maxRows: 10000, format: "xlsx",
-      message: this.config ? "标准ERP导出优先使用 erp_native_export_file；不需要同事登录。" : "原生接口尚未配置或部署。不要声称已调用ERP原生导出，也不要悄悄替换成自定义SQL导出。" };
+    return { configured: Boolean(this.config), discovery: "dynamic_source_plan", maxRows: 10000, maxBytes: 30 * 1024 * 1024, format: "xlsx",
+      workflow: ["确认用户意图与ERP页面权限", "用project_search/project_read_file定位Controller导出入口", "定位Service中返回数据与表头的方法", "提交一次性受控导出计划"],
+      message: this.config ? "不使用业务类型白名单；从ERP源码动态发现已有导出能力，由PHP二次校验源码、路由、本人权限和生产只读连接。" : "原生导出服务未配置。" };
   }
 
   async create(call: DynamicToolCall, context: ErpAccessContext, args: Record<string, unknown>): Promise<GuestExportFile> {
     if (!this.config) throw new Error("ERP原生导出入口尚未部署/配置；同事不需要提供登录凭证，请管理员完成服务接入。");
-    if (Object.keys(args).some((key) => key !== "kind" && key !== "filters")) throw new Error("原生导出只接受已登记类型和筛选条件。");
-    const { kind, filters } = validateNativeExport(args.kind, args.filters);
-    const digest = createHash("sha256").update(JSON.stringify([call.threadId, call.turnId, context.feishuUserId, kind, filters])).digest("hex");
+    if (Object.keys(args).some((key) => key !== "plan")) throw new Error("原生导出只接受从ERP源码定位的受控计划。");
+    const plan = validateNativeExport(args.plan);
+    const digest = createHash("sha256").update(JSON.stringify([call.threadId, call.turnId, context.feishuUserId, plan])).digest("hex");
     const requestId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
     let running = this.running.get(requestId);
     if (!running) {
-      running = this.execute({ requestId, feishuUserId: context.feishuUserId, kind, filters });
+      running = this.execute({ requestId, feishuUserId: context.feishuUserId, plan });
       this.running.set(requestId, running);
     }
     try {
@@ -96,7 +97,7 @@ export class NativeExportManager {
     const worker = new URL(`./native-export-worker${extname(import.meta.url)}`, import.meta.url).href;
     await fs.writeFile(join(directory, "request.json"), JSON.stringify(request), { mode: 0o600 });
     await fs.writeFile(join(directory, "runner.mjs"), `import { runNativeExportWorker } from ${JSON.stringify(worker)};\nrunNativeExportWorker().catch(e => { process.stderr.write(String(e.message).slice(0,500)); process.exitCode=1; });\n`, { mode: 0o600 });
-    this.logger.info("ERP原生导出脚本启动", { requestId: request.requestId, kind: request.kind });
+    this.logger.info("ERP原生导出脚本启动", { requestId: request.requestId, route: request.plan.route, service: request.plan.className, method: request.plan.dataMethod });
     const loader = extname(import.meta.url) === ".ts" ? ["--import", createRequire(import.meta.url).resolve("tsx")] : [];
     await new Promise<void>((resolve, reject) => {
       const child = spawn(process.execPath, ["--max-old-space-size=256", ...loader, join(directory, "runner.mjs")], {

@@ -48,5 +48,6 @@ export async function runNativeExportWorker(): Promise<void> {
   await workbook.xlsx.readFile(part);
   if (workbook.worksheets.length !== 1 || workbook.worksheets[0]!.rowCount - 1 !== result.rowCount) throw new Error("ERP导出文件实际行数与任务记录不一致。");
   await rename(part, join(directory, "result.xlsx"));
-  await writeFile(join(directory, "result.json"), JSON.stringify({ rowCount: result.rowCount, fileName: request.kind === "channel_stock" ? "渠道库存.xlsx" : "采购单商品明细.xlsx" }), { mode: 0o600 });
+  if (typeof result.fileName !== "string" || result.fileName.length < 6 || result.fileName.length > 125 || !result.fileName.toLowerCase().endsWith(".xlsx") || /[\\/\0\r\n]/.test(result.fileName)) throw new Error("ERP返回的导出文件名无效。");
+  await writeFile(join(directory, "result.json"), JSON.stringify({ rowCount: result.rowCount, fileName: result.fileName }), { mode: 0o600 });
 }

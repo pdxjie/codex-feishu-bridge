@@ -103,6 +103,7 @@ type GuestRecoveryInternals = {
   guestDesktopSync: { enqueue: (threadId: string) => void; flush: () => Promise<void> };
   submitGuestPrompt: (openId: string, chatId: string, text: string) => Promise<void>;
   createNewGuestThread: (openId: string, chatId: string) => Promise<void>;
+  finishTurn: (params: Record<string, unknown>) => Promise<void>;
 };
 
 function thread(id: string, projectId = "project-1"): CodexThread {
@@ -399,6 +400,47 @@ test("访客会话被 Desktop 占用时自动更换只读执行线程", async ()
     assert.equal(store.getGuestThreadForUser("ou_guest")?.threadId, "thread-new");
     assert.equal(app.activeTurns.get("thread-new"), "turn-new");
     assert.equal(app.activeTurns.has("thread-locked"), false);
+  } finally {
+    store.close();
+  }
+});
+
+test("访客任务完成后先清除运行状态再刷新 Desktop", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-feishu-guest-complete-"));
+  const store = new StateStore(join(directory, "state.db"));
+  store.addGuestThread("ou_guest", "thread-new", "自主排查@张三", true);
+  store.setTurnRoute("thread-new", "turn-new", "ou_guest", "oc_guest", "guest");
+  const app = Object.create(BridgeApp.prototype) as GuestRecoveryInternals & {
+    finalMessages: Map<string, string>;
+    deliverResult: () => Promise<void>;
+    sendGuestExportFiles: () => Promise<void>;
+  };
+  app.store = store;
+  app.activeTurns = new Map([["thread-new", "turn-new"]]);
+  app.liveProgress = new Map();
+  app.finalMessages = new Map([["turn-new", "完成"]]);
+  app.guestDesktopRegistrations = new Set();
+  app.guestCodex = {
+    async startReadOnlyTurn() { return "unused"; },
+    async createReadOnlyThread() { return thread("unused"); },
+    async setThreadName() {},
+    async unsubscribeThread() {},
+  } as GuestRecoveryInternals["guestCodex"];
+  let runningWhenDesktopRefreshes: boolean | undefined;
+  app.guestDesktopSync = {
+    enqueue() { runningWhenDesktopRefreshes = app.activeTurns.has("thread-new"); },
+    async flush() {},
+  };
+  app.deliverResult = async () => {};
+  app.sendGuestExportFiles = async () => {};
+
+  try {
+    await app.finishTurn({
+      threadId: "thread-new",
+      turn: { id: "turn-new", status: "completed", items: [] },
+    });
+    assert.equal(runningWhenDesktopRefreshes, false);
+    assert.equal(app.activeTurns.has("thread-new"), false);
   } finally {
     store.close();
   }

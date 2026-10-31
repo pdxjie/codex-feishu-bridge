@@ -1,3 +1,4 @@
+import { streamingRunningCard } from "./streaming-card.js";
 import type { ApprovalRequest, CodexThread } from "../codex/types.js";
 import type { ProjectGroup } from "../projects.js";
 
@@ -202,53 +203,19 @@ export function guestHelpCard(): Card {
 
 export type LiveProgressView = {
   threadTitle: string;
+  prompt?: string;
+  animationFrame?: number;
+  toolActivities?: string[];
   reasoningSummary?: string;
   plan?: string;
   latestMessage?: string;
   activities?: string[];
+  startedAt?: number;
   elapsedSeconds?: number;
 };
 
 export function runningCard(threadId: string, turnId: string, progress?: LiveProgressView): Card {
-  const details = progress
-    ? [
-        markdown(
-          `**会话：${escapeMarkdown(progress.threadTitle)}**\n` +
-            `状态：正在执行${typeof progress.elapsedSeconds === "number" ? ` · 已用时 ${formatDuration(progress.elapsedSeconds)}` : ""}`,
-        ),
-        ...(progress.reasoningSummary
-          ? [section("思考摘要（公开）", truncate(progress.reasoningSummary, 3_500))]
-          : []),
-        ...(progress.plan ? [section("执行计划", truncate(progress.plan, 2_500))] : []),
-        ...(progress.activities?.length
-          ? [section("实时进度", progress.activities.slice(-8).map((item) => `- ${escapeMarkdown(item)}`).join("\n"))]
-          : []),
-        ...(progress.latestMessage ? [section("实时公开回复", truncate(progress.latestMessage, 4_500))] : []),
-        markdown(`会话 ID：\`${threadId}\`\nTurn：\`${turnId}\``),
-      ]
-    : [markdown(`任务已提交。\n会话：\`${threadId}\`\nTurn：\`${turnId}\``)];
-  return card(
-    progress ? `【${truncate(progress.threadTitle.replace(/\s+/g, " ").trim(), 60)}】Codex 正在工作` : "Codex 正在工作",
-    [
-      ...details,
-      {
-        tag: "action",
-        actions: [
-          {
-            tag: "button",
-            type: "danger",
-            text: { tag: "plain_text", content: "停止任务" },
-            value: { action: "stop_turn", threadId, turnId },
-            confirm: {
-              title: { tag: "plain_text", content: "停止任务" },
-              text: { tag: "plain_text", content: "确认中断当前 Codex 任务吗？" },
-            },
-          },
-        ],
-      },
-    ],
-    "wathet",
-  );
+  return streamingRunningCard(threadId, turnId, progress);
 }
 
 function section(title: string, content: string): Record<string, unknown> {
@@ -296,10 +263,11 @@ export function threadResultCard(threadTitle: string, content: string, failed = 
   );
 }
 
-export function renderMarkdownElements(content: string): Record<string, unknown>[] {
+export function renderMarkdownElements(content: string, nativeTables = false): Record<string, unknown>[] {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   const elements: Record<string, unknown>[] = [];
   const text: string[] = [];
+  let fence: string | undefined;
 
   const flushText = (): void => {
     const value = normalizeMarkdownBlock(text.splice(0).join("\n").trim());
@@ -308,6 +276,13 @@ export function renderMarkdownElements(content: string): Record<string, unknown>
   };
 
   for (let index = 0; index < lines.length; ) {
+    const fenceMatch = lines[index]?.trim().match(/^(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      if (!fence) fence = fenceMatch[1];
+      else if (fenceMatch[1] && fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length) fence = undefined;
+      text.push(lines[index] ?? ''); index += 1; continue;
+    }
+    if (fence) { text.push(lines[index] ?? ''); index += 1; continue; }
     const header = parseTableRow(lines[index] ?? "");
     const separator = lines[index + 1];
     if (header && separator !== undefined && isTableSeparator(separator, header.length)) {
@@ -320,7 +295,7 @@ export function renderMarkdownElements(content: string): Record<string, unknown>
         rows.push(normalizeTableWidth(row, header.length));
         index += 1;
       }
-      elements.push(...renderTable(header, rows));
+      elements.push(...(nativeTables && header.length <= 8 && rows.length ? renderNativeTable(header, rows) : renderTable(header, rows)));
       continue;
     }
     text.push(lines[index] ?? "");
@@ -334,6 +309,19 @@ export function renderMarkdownElements(content: string): Record<string, unknown>
   });
   if (compact.length <= 45) return compact.length > 0 ? compact : [markdown("任务已结束，但没有返回文本结果。")];
   return [...compact.slice(0, 44), markdown("…结果较长，飞书卡片仅展示前面的内容。请继续追问以查看剩余数据。")];
+}
+
+function renderNativeTable(headers: string[], rows: string[][]): Record<string, unknown>[] {
+  const visible = rows.slice(0, 50);
+  return [
+    markdown(`**查询明细 · ${rows.length} 条**`),
+    { tag: 'table', page_size: 5, row_height: 'low',
+      header_style: { bold: true, background_style: 'grey', lines: 2 },
+      columns: headers.map((header, i) => ({ name: `col_${i}`, display_name: stripInlineMarkdown(header), data_type: 'text', width: 'auto' })),
+      rows: visible.map(row => Object.fromEntries(headers.map((_, i) => [`col_${i}`, stripInlineMarkdown(row[i] || '—')]))),
+    },
+    ...(rows.length > visible.length ? [markdown(`_卡片展示前 ${visible.length} 条；可请求导出完整明细。_`)] : []),
+  ];
 }
 
 function renderTable(headers: string[], rows: string[][]): Record<string, unknown>[] {

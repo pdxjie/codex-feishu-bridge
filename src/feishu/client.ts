@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { finalCardV2, isStreamingCard, nonStreamingCard, streamTextElements } from "./streaming-card.js";
 import * as lark from "@larksuiteoapi/node-sdk";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -26,7 +28,11 @@ export type CardAction = {
 type MessageHandler = (message: IncomingMessage) => Promise<void>;
 type CardActionHandler = (action: CardAction) => Promise<void>;
 
+type StreamEntity = { cardId: string; sequence: number; texts: Map<string, string>; failures: number; tail: Promise<void> };
+
 export class FeishuClient {
+  private readonly streams = new Map<string, StreamEntity>();
+  private streamingUnavailableUntil = 0;
   private readonly api: lark.Client;
   private readonly ws: lark.WSClient;
   private readonly dispatcher: lark.EventDispatcher;
@@ -92,24 +98,76 @@ export class FeishuClient {
   }
 
   async sendCard(chatId: string, card: Record<string, unknown>): Promise<string> {
+    let cardId: string | undefined;
+    if (isStreamingCard(card) && Date.now() >= this.streamingUnavailableUntil) {
+      try {
+        const created = await this.api.cardkit.v1.card.create({ data: { type: "card_json", data: JSON.stringify(card) } });
+        checkCardResponse(created);
+        cardId = created.data?.card_id;
+        if (!cardId) throw new Error("CardKit未返回card_id");
+      } catch {
+        this.streamingUnavailableUntil = Date.now() + 10 * 60_000;
+        this.logger.warn("飞书原生流式卡片暂不可用，自动使用普通实时卡片");
+      }
+    }
     const response = await this.api.im.message.create({
       params: { receive_id_type: "chat_id" },
-      data: {
-        receive_id: chatId,
-        msg_type: "interactive",
-        content: JSON.stringify(card),
-      },
+      data: { receive_id: chatId, msg_type: "interactive",
+        content: JSON.stringify(cardId ? { type: "card", data: { card_id: cardId } } : isStreamingCard(card) ? nonStreamingCard(card) : card) },
     });
+    checkCardResponse(response);
     const messageId = response.data?.message_id;
     if (!messageId) throw new Error("飞书发送卡片成功，但响应中没有 message_id");
+    if (cardId) this.streams.set(messageId, { cardId, sequence: 0, texts: streamTextElements(card), failures: 0, tail: Promise.resolve() });
     return messageId;
   }
 
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
-    await this.api.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(card) },
+    const stream = this.streams.get(messageId);
+    if (!stream) {
+      const response = await this.api.im.message.patch({ path: { message_id: messageId },
+        data: { content: JSON.stringify(isStreamingCard(card) ? nonStreamingCard(card) : card) } });
+      checkCardResponse(response);
+      return;
+    }
+    const update = stream.tail.catch(() => undefined).then(async () => {
+      if (this.streams.get(messageId) !== stream) return this.updateCard(messageId, card);
+      if (!isStreamingCard(card)) {
+        try {
+          checkCardResponse(await this.api.cardkit.v1.card.settings({ path: { card_id: stream.cardId },
+            data: { sequence: ++stream.sequence, uuid: randomUUID(), settings: JSON.stringify({ config: { streaming_mode: false } }) } }));
+          checkCardResponse(await this.api.cardkit.v1.card.update({ path: { card_id: stream.cardId },
+            data: { sequence: ++stream.sequence, uuid: randomUUID(), card: { type: "card_json", data: JSON.stringify(finalCardV2(card)) } } }));
+        } finally { this.streams.delete(messageId); }
+        return;
+      }
+      // Only changed text is sent. Prefix-preserving content triggers Feishu's
+      // native typewriter animation and keeps panels/buttons in place.
+      const texts = streamTextElements(card);
+      for (const id of new Set(["reply", ...texts.keys()])) {
+        const content = texts.get(id);
+        if (content === undefined || content === stream.texts.get(id)) continue;
+        checkCardResponse(await this.api.cardkit.v1.cardElement.content({
+          path: { card_id: stream.cardId, element_id: id },
+          data: { content, sequence: ++stream.sequence, uuid: randomUUID() },
+        }));
+        stream.texts.set(id, content);
+      }
     });
+    stream.tail = update;
+    try { await update; stream.failures = 0; }
+    catch (error) {
+      stream.failures++;
+      if (isStreamingCard(card) && stream.failures >= 3) {
+        const response = await this.api.im.message.patch({ path: { message_id: messageId },
+          data: { content: JSON.stringify(nonStreamingCard(card)) } });
+        checkCardResponse(response);
+        this.streams.delete(messageId);
+        this.logger.warn("流式文本更新连续失败，已切换为普通实时卡片");
+        return;
+      }
+      throw error;
+    }
   }
 
   async sendFile(chatId: string, path: string, fileName: string): Promise<string> {
@@ -389,4 +447,12 @@ function detectImageContentType(buffer: Buffer): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+
+function checkCardResponse(response: { code?: number | undefined; msg?: string | undefined }): void {
+  if (response.code !== undefined && response.code !== 0) {
+    // Do not log SDK request objects: they may include authorization headers.
+    throw new Error(`飞书卡片接口返回错误（code=${response.code}）`);
+  }
 }

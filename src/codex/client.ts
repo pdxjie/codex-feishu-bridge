@@ -362,6 +362,12 @@ export class CodexClient extends EventEmitter {
       });
       return;
     }
+    const notify = (completed: boolean, success = true) => this.emit("notification", {
+      method: completed ? "bridge/tool/completed" : "bridge/tool/started",
+      params: { threadId, turnId, item: { id: callId, type: "dynamicToolCall", tool,
+        status: completed ? success ? "completed" : "failed" : "inProgress" } },
+    });
+    notify(false);
     try {
       const result = await this.options.dynamicToolHandler({
         threadId,
@@ -370,8 +376,10 @@ export class CodexClient extends EventEmitter {
         tool,
         arguments: params.arguments,
       });
+      notify(true, result.success);
       this.rpc.respond(request.id, result);
     } catch (error) {
+      notify(true, false);
       this.rpc.respond(request.id, {
         success: false,
         contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],

@@ -1,36 +1,90 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 
 export type NativeExportConfig = { endpoint: string; secretFile: string };
-export type NativeExportRequest = { requestId: string; feishuUserId: string; kind: string; filters: Record<string, unknown> };
-export const PURCHASE_EXPORT_FIELDS = ["order_no", "create_order_time", "sku", "origin_sku", "goods_name", "number", "surplus_number", "plan_transport_number", "estimate_date", "contract_status_text", "supplier_info_name", "supplier_header_name", "purchase_price", "mc_purchase_price", "currency_code"];
-export const NATIVE_EXPORT_CATALOG = [
-  { kind: "channel_stock", name: "ERP渠道库存列表", pagePermission: 881, filters: ["sku（可选）", "platformId（必填渠道ID）", "countryId（可选）", "storehouseId（可选）"], fields: "原ERP固定的8列：库存批次、仓库、商品名称、SKU、入库数量、剩余库存、渠道、国家。", note: "需要该页面权限；联合排查能力不替代整页原生导出权限。" },
-  { kind: "purchase_orders", name: "ERP采购单商品明细", pagePermission: 22, exportPermission: 895, filters: ["startDate（必填YYYY-MM-DD）", "endDate（必填，含当天，最多31天）", "sku（可选，沿用ERP按SKU匹配采购单的口径，可能包括同单其他商品）", "fields（可选）"], fields: PURCHASE_EXPORT_FIELDS, note: "复用ERP归属和字段权限；不是按SKU精确筛选的自定义明细表。" },
-];
+export type NativeExportArgument = "filters" | "erpUserId" | "rowLimit";
+export type NativeExportPlan = {
+  pagePurviewId: number;
+  route: string;
+  controllerFile: string;
+  controllerMethod: string;
+  serviceFile: string;
+  className: string;
+  factory: "new" | "getInstance";
+  dataMethod: string;
+  titleMethod: string;
+  dataArguments: NativeExportArgument[];
+  titleArguments: NativeExportArgument[];
+  resultMode: "rows" | "bundle";
+  filters: Record<string, unknown>;
+  fileName: string;
+  sheetName: string;
+};
+export type NativeExportRequest = { requestId: string; feishuUserId: string; plan: NativeExportPlan };
 
-export function validateNativeExport(kind: unknown, filters: unknown): { kind: string; filters: Record<string, unknown> } {
-  if (kind !== "channel_stock" && kind !== "purchase_orders") throw new Error("暂无法确认数据授权范围：该原生导出尚未接入。");
-  if (!filters || typeof filters !== "object" || Array.isArray(filters)) throw new Error("导出筛选条件必须是对象。");
-  const f = filters as Record<string, unknown>;
-  const allowed = kind === "channel_stock" ? ["sku", "platformId", "countryId", "storehouseId"] : ["startDate", "endDate", "sku", "fields"];
-  if (Object.keys(f).some((key) => !allowed.includes(key))) throw new Error("原生导出不接受自定义URL、脚本、SQL、用户身份或未登记的筛选条件。");
-  if (f.sku !== undefined && (typeof f.sku !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(f.sku))) throw new Error("SKU格式无效。");
-  if (kind === "channel_stock") {
-    if (f.platformId === undefined) throw new Error("请明确导出渠道。");
-    for (const key of ["platformId", "countryId", "storehouseId"]) {
-      if (f[key] !== undefined && (typeof f[key] !== "number" || !Number.isSafeInteger(f[key]) || Number(f[key]) <= 0)) throw new Error(`无效参数 ${key}`);
-    }
-  } else {
-    for (const key of ["startDate", "endDate"]) {
-      const value = f[key];
-      if (typeof value !== "string" || !/^20\d{2}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value) throw new Error("请提供有效起止日期 YYYY-MM-DD。");
-    }
-    const days = (Date.parse(String(f.endDate)) - Date.parse(String(f.startDate))) / 86400000;
-    if (days < 0 || days >= 31) throw new Error("日期范围必须正序且不超过31天。");
-    if (f.fields !== undefined && (!Array.isArray(f.fields) || f.fields.length === 0 || f.fields.length > PURCHASE_EXPORT_FIELDS.length || f.fields.some((v) => typeof v !== "string" || !PURCHASE_EXPORT_FIELDS.includes(v)))) throw new Error("导出字段尚未登记或不允许。");
-  }
-  return { kind, filters: Object.fromEntries(Object.entries(f).sort(([a], [b]) => a.localeCompare(b))) };
+const PLAN_KEYS = ["pagePurviewId", "route", "controllerFile", "controllerMethod", "serviceFile", "className", "factory", "dataMethod", "titleMethod", "dataArguments", "titleArguments", "resultMode", "filters", "fileName", "sheetName"];
+const ARGUMENTS = new Set<NativeExportArgument>(["filters", "erpUserId", "rowLimit"]);
+
+/** Validate a source-discovered declarative plan. There is intentionally no business-kind enum. */
+export function validateNativeExport(plan: unknown): NativeExportPlan {
+  if (!isRecord(plan) || Object.keys(plan).some((key) => !PLAN_KEYS.includes(key))) throw new Error("导出计划参数无效。");
+  const pagePurviewId = positiveInteger(plan.pagePurviewId, "pagePurviewId");
+  const route = text(plan.route, "route", 180);
+  if (!/^\/[A-Za-z][A-Za-z0-9_-]*(?:\/[A-Za-z][A-Za-z0-9_-]*){1,2}$/.test(route)) throw new Error("ERP导出路由格式无效。");
+  const controllerFile = text(plan.controllerFile, "controllerFile", 300);
+  if (!/^application\/admin\/(?:controller\/[A-Za-z0-9_]+\.php|App\/Presentation\/Http\/[A-Za-z0-9_]+\/Controller\/[A-Za-z0-9_]+Controller\.php)$/.test(controllerFile)) throw new Error("导出入口必须是ERP Controller源码。");
+  const controllerMethod = identifier(plan.controllerMethod, "controllerMethod");
+  if (!/export/i.test(controllerMethod) || route.split("/").at(-1)!.toLowerCase() !== controllerMethod.toLowerCase()) throw new Error("导出路由与Controller方法不匹配。");
+  const serviceFile = text(plan.serviceFile, "serviceFile", 300);
+  if (!/^application\/admin\/(?:service(?:\/[A-Za-z0-9_]+)*\/[A-Za-z0-9_]+Service\.php|App\/Domain\/[A-Za-z0-9_]+\/Service\/[A-Za-z0-9_]+Service\.php)$/.test(serviceFile)) throw new Error("只能调用ERP Service中的导出数据构建方法。");
+  const className = text(plan.className, "className", 220);
+  if (!/^(?:[A-Za-z_][A-Za-z0-9_]*\\)*[A-Za-z_][A-Za-z0-9_]*Service$/.test(className)) throw new Error("ERP Service类名无效。");
+  if (plan.factory !== "new" && plan.factory !== "getInstance") throw new Error("不支持的Service创建方式。");
+  const dataMethod = identifier(plan.dataMethod, "dataMethod");
+  const titleMethod = identifier(plan.titleMethod, "titleMethod");
+  if (!/export/i.test(dataMethod) || /^(?:create|add|update|delete|save|upload|send|dispatch)/i.test(dataMethod) || /^queueExportData$/i.test(dataMethod) || !/(title|header)/i.test(titleMethod)) throw new Error("必须定位ERP已有的只读导出数据和表头方法。");
+  const dataArguments = argumentList(plan.dataArguments, "dataArguments");
+  const titleArguments = argumentList(plan.titleArguments, "titleArguments");
+  if (!dataArguments.includes("filters")) throw new Error("导出数据方法必须接收本次筛选条件。");
+  if (plan.resultMode !== "rows" && plan.resultMode !== "bundle") throw new Error("导出结果结构无效。");
+  if (!isRecord(plan.filters)) throw new Error("导出筛选条件必须是对象。");
+  validateJson(plan.filters, 0);
+  const fileName = normalizeFileName(text(plan.fileName, "fileName", 120));
+  const sheetName = text(plan.sheetName ?? "ERP导出", "sheetName", 31);
+  if (/[\\\/:*?\[\]]/.test(sheetName)) throw new Error("Excel工作表名无效。");
+  return {
+    pagePurviewId, route, controllerFile, controllerMethod, serviceFile, className,
+    factory: plan.factory, dataMethod, titleMethod, dataArguments, titleArguments,
+    resultMode: plan.resultMode, filters: stableRecord(plan.filters), fileName, sheetName,
+  };
 }
+
+function argumentList(value: unknown, field: string): NativeExportArgument[] {
+  if (!Array.isArray(value) || value.length > 4 || value.some((item) => typeof item !== "string" || !ARGUMENTS.has(item as NativeExportArgument))) throw new Error(`${field}无效。`);
+  return value as NativeExportArgument[];
+}
+
+function validateJson(value: unknown, depth: number): void {
+  if (depth > 4) throw new Error("导出筛选条件嵌套过深。");
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "number") { if (!Number.isFinite(value) || !Number.isSafeInteger(value)) throw new Error("导出数字参数无效。"); return; }
+  if (typeof value === "string") { if (value.length > 2000 || /[\0\u0001-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) throw new Error("导出文本参数无效。"); return; }
+  if (Array.isArray(value)) { if (value.length > 1000) throw new Error("导出数组参数过大。"); for (const item of value) validateJson(item, depth + 1); return; }
+  if (!isRecord(value) || Object.keys(value).length > 200) throw new Error("导出筛选条件无效。");
+  for (const [key, item] of Object.entries(value)) {
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key)) throw new Error(`导出筛选字段无效：${key}`);
+    validateJson(item, depth + 1);
+  }
+}
+
+function stableRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, Array.isArray(item) ? item.map(stableValue) : stableValue(item)]));
+}
+function stableValue(value: unknown): unknown { return isRecord(value) ? stableRecord(value) : value; }
+function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+function text(value: unknown, field: string, maximum: number): string { if (typeof value !== "string" || value.length < 1 || value.length > maximum) throw new Error(`${field}无效。`); return value; }
+function identifier(value: unknown, field: string): string { const result = text(value, field, 100); if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(result)) throw new Error(`${field}无效。`); return result; }
+function positiveInteger(value: unknown, field: string): number { if (!Number.isSafeInteger(value) || Number(value) <= 0) throw new Error(`${field}无效。`); return Number(value); }
+function normalizeFileName(value: string): string { if (/[\\/\0\r\n]/.test(value) || value === "." || value === "..") throw new Error("导出文件名无效。"); return value.toLowerCase().endsWith(".xlsx") ? value : `${value}.xlsx`; }
 
 export function validateEndpoint(value: string): string {
   const url = new URL(value);
@@ -48,9 +102,9 @@ export async function exportRequest(endpoint: string, secret: string, action: st
   const body = JSON.stringify(request);
   const response = await fetch(validateEndpoint(endpoint), { method: "POST", body, headers: signedHeaders(action, body, secret), redirect: "error", signal: AbortSignal.timeout(timeout) });
   if (!response.ok) {
-    const text = await boundedText(response, 8192);
+    const bodyText = await boundedText(response, 8192);
     let message = "原生导出服务调用失败";
-    try { const result = JSON.parse(text); if (typeof result.message === "string") message = result.message.slice(0, 300); } catch { /* never expose an HTML error or credentials */ }
+    try { const result = JSON.parse(bodyText); if (typeof result.message === "string") message = result.message.slice(0, 300); } catch { /* never expose an HTML error or credentials */ }
     const error = new Error(`${message}（HTTP ${response.status}）`);
     Object.assign(error, { status: response.status });
     throw error;

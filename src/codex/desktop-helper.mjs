@@ -3,9 +3,13 @@ import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, basename, join } from "node:path";
 import { createInterface } from "node:readline";
 import net from "node:net";
+import { discoverParentDesktopPipePath } from "./parent-pipe.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
-const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH?.trim();
+// User MCP environments may omit the Desktop pipe variable. The helper is
+// Desktop-owned, so discover it only from the current process ancestry and
+// accept only a current-user Unix socket in the app-tools directory.
+const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH?.trim() || discoverParentDesktopPipePath();
 const bridgeSocketPath = process.env.CODEX_FEISHU_HELPER_SOCKET?.trim();
 // Each Desktop-owned MCP process owns its own socket. No shared pathname can
 // disappear when another session's helper exits; clients discover all owners.
@@ -13,8 +17,8 @@ const ownedSocketPath = bridgeSocketPath
   ? join(dirname(bridgeSocketPath), `${basename(bridgeSocketPath, ".sock")}-${process.pid}.sock`)
   : null;
 
-if (!pipePath && !bridgeSocketPath) {
-  process.stderr.write("缺少 CODEX_APP_TOOLS_PIPE_PATH 或 CODEX_FEISHU_HELPER_SOCKET\n");
+if (!pipePath) {
+  process.stderr.write("缺少由 Codex Desktop 注入的 CODEX_APP_TOOLS_PIPE_PATH\n");
   process.exit(2);
 }
 
@@ -135,9 +139,11 @@ function encodeFrame(text) {
 const nativeByPath = new Map();
 const toolsByPath = new Map();
 
-function getNative(message) {
-  const targetPath = message.desktopPipePath?.trim() || pipePath;
-  if (!targetPath) throw new Error("缺少 Codex Desktop pipe path");
+function getNative() {
+  // 只允许连接 Desktop 注入给当前受信任 MCP 进程的 pipe。
+  // 不接受桥接客户端传入的路径，避免新版 Desktop 的进程身份校验
+  // 拒绝连接，也避免误连 /tmp 中其他账号或旧宿主遗留的 socket。
+  const targetPath = pipePath;
   let native = nativeByPath.get(targetPath);
   if (!native) {
     native = new NativePipeClient(targetPath);
@@ -146,8 +152,8 @@ function getNative(message) {
   return { native, targetPath };
 }
 
-async function listTools(message) {
-  const { native, targetPath } = getNative(message);
+async function listTools() {
+  const { native, targetPath } = getNative();
   const result = await native.request("tools/list", { threadStartKind: "all" });
   if (!result || !Array.isArray(result.tools)) throw new Error("Codex Desktop 工具目录无效");
   toolsByPath.set(targetPath, new Map(result.tools.map((tool) => [tool.name, tool])));
@@ -155,8 +161,8 @@ async function listTools(message) {
 }
 
 async function callTool(request) {
-  const { native, targetPath } = getNative(request);
-  if (!toolsByPath.has(targetPath)) await listTools(request);
+  const { native, targetPath } = getNative();
+  if (!toolsByPath.has(targetPath)) await listTools();
   const toolsByName = toolsByPath.get(targetPath);
   const tool = toolsByName.get(request.tool);
   if (!tool) throw new Error(`Codex Desktop 不支持工具：${request.tool}`);
@@ -173,7 +179,7 @@ async function callTool(request) {
 
 async function handle(message) {
   if (message.method === "ping") {
-    const tools = await listTools(message);
+    const tools = await listTools();
     return { tools: tools.map((tool) => tool.name) };
   }
   if (message.method === "call") return callTool(message);

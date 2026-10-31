@@ -105,14 +105,30 @@ export class GuestReadonlyTools {
 
   specs(): DynamicToolSpec[] {
     return [
-      tool("erp_export_catalog", "查看已接入ERP原生导出的业务、筛选条件、字段与服务是否就绪。用户明确要求标准业务导出时先调用；未接入不代表ERP本身没有该功能。", {}),
-      tool("erp_native_export_file", "通过服务认证调用ERP原有导出逻辑，生成真实Excel并在结束后发送当前飞书聊天。无需用户登录。ERP校验本人页面、导出和数据权限。仅明确要求导出时使用；固定执行脚本，不接受URL、SQL、代码或身份。先从erp_export_catalog确认准确匹配。", {
-        kind: { type: "string", enum: ["channel_stock", "purchase_orders"] },
-        filters: { type: "object", additionalProperties: false, properties: {
-          sku: { type: "string" }, platformId: { type: "integer", minimum: 1 }, countryId: { type: "integer", minimum: 1 }, storehouseId: { type: "integer", minimum: 1 },
-          startDate: { type: "string" }, endDate: { type: "string" }, fields: { type: "array", items: { type: "string" } },
-        } },
-      }, ["kind", "filters"]),
+      tool("erp_export_catalog", "查看ERP原生导出的动态发现流程与服务状态。它不返回业务白名单；用户要求ERP已有导出时，应继续查找真实Controller、Service、筛选参数和表头方法。", {}),
+      tool("erp_native_export_file", "执行从ERP源码动态定位的一次性导出计划。先用erp_page_access、project_search和project_read_file确认真实页面、导出Controller路由、只读Service数据方法、表头方法及原生筛选参数。PHP会二次校验源文件、方法、路由权限、页面权限和生产只读连接；不接受PHP、SQL、Shell、URL或用户身份。", {
+        plan: {
+          type: "object", additionalProperties: false,
+          properties: {
+            pagePurviewId: { type: "integer", minimum: 1 },
+            route: { type: "string", description: "ERP原导出路由，例如/transportOrder/queueExportData" },
+            controllerFile: { type: "string", description: "项目相对Controller文件" },
+            controllerMethod: { type: "string" },
+            serviceFile: { type: "string", description: "项目相对Service文件" },
+            className: { type: "string", description: "完整PHP Service类名" },
+            factory: { type: "string", enum: ["new", "getInstance"] },
+            dataMethod: { type: "string", description: "返回导出行的现有Service方法" },
+            titleMethod: { type: "string", description: "返回表头的现有Service方法" },
+            dataArguments: { type: "array", maxItems: 4, items: { type: "string", enum: ["filters", "erpUserId", "rowLimit"] } },
+            titleArguments: { type: "array", maxItems: 4, items: { type: "string", enum: ["filters", "erpUserId", "rowLimit"] } },
+            resultMode: { type: "string", enum: ["rows", "bundle"], description: "rows=数据方法直接返回行；bundle=返回{title,data}" },
+            filters: { type: "object", additionalProperties: true, description: "原ERP导出方法的业务筛选参数" },
+            fileName: { type: "string", minLength: 1, maxLength: 120 },
+            sheetName: { type: "string", minLength: 1, maxLength: 31 },
+          },
+          required: ["pagePurviewId", "route", "controllerFile", "controllerMethod", "serviceFile", "className", "factory", "dataMethod", "titleMethod", "dataArguments", "titleArguments", "resultMode", "filters", "fileName", "sheetName"],
+        },
+      }, ["plan"]),
       tool("erp_access_profile", "查看当前飞书用户映射到 ERP 后的角色、可访问模块与数据范围。首次排查应先调用。", {}),
       tool("erp_page_access", "按关键词搜索页面候选。已登记页面返回dataSources和dataAccessHint：直接查询该页面无需库存联合诊断角色。只有目标页面匹配且hasAccess=false才判无权；已授权却映射失败是桥接适配问题，不能要求用户截图或开权限。库存联合排查另走inventory_diagnose。", {
         query: { type: "string", minLength: 1, maxLength: 80 },

@@ -15,18 +15,33 @@ import { Logger } from "../src/logger.js";
 const logger = new Logger("error");
 const context = (id: string) => ({ feishuUserId: id } as ErpAccessContext);
 const call = (turnId: string) => ({ threadId: "thread", turnId, callId: turnId, tool: "erp_native_export_file", arguments: {} });
-const args = { kind: "channel_stock", filters: { platformId: 1 } };
+const plan = {
+  pagePurviewId: 23,
+  route: "/transportOrder/queueExportData",
+  controllerFile: "application/admin/controller/MuaTransportOrder.php",
+  controllerMethod: "queueExportData",
+  serviceFile: "application/admin/service/TransportOrderService.php",
+  className: "service\\TransportOrderService",
+  factory: "new",
+  dataMethod: "queueExport",
+  titleMethod: "getExportTitle",
+  dataArguments: ["filters", "erpUserId"],
+  titleArguments: ["filters"],
+  resultMode: "rows",
+  filters: { order_date_type: 1, order_type_date_from: "2026-10-25", order_type_date_to: "2026-10-31", select_fields: "invoice_no,sku,goods_name,actual_packing_number" },
+  fileName: "近一周出运单明细.xlsx",
+  sheetName: "出运单明细",
+};
+const args = { plan };
 
-test("原生导出参数不能注入脚本/SQL/身份，日期和字段有明确边界", () => {
-  for (const key of ["sql", "url", "script", "feishuUserId"]) assert.throws(() => validateNativeExport("channel_stock", { platformId: 1, [key]: "bad" }));
-  for (const filters of [{ platformId: 0 }, { platformId: "1" }, { platformId: 1, countryId: null }]) assert.throws(() => validateNativeExport("channel_stock", filters));
-  for (const filters of [
-    { startDate: "2026-02-30", endDate: "2026-03-01" },
-    { startDate: "2026-10-01", endDate: "2026-11-01" },
-    { startDate: "2026-10-02", endDate: "2026-10-01" },
-    { startDate: "2026-10-01", endDate: "2026-10-31", fields: [{ sql: "x" }] },
-  ]) assert.throws(() => validateNativeExport("purchase_orders", filters));
-  validateNativeExport("purchase_orders", { startDate: "2026-10-01", endDate: "2026-10-31" });
+test("动态原生导出计划不是业务白名单，也不接受代码、越界文件或伪造路由", () => {
+  assert.equal(validateNativeExport(plan).dataMethod, "queueExport");
+  assert.throws(() => validateNativeExport({ ...plan, script: "phpinfo();" }));
+  assert.throws(() => validateNativeExport({ ...plan, serviceFile: "../../tmp/EvilService.php" }));
+  assert.throws(() => validateNativeExport({ ...plan, className: "Evil" }));
+  assert.throws(() => validateNativeExport({ ...plan, controllerMethod: "deleteContent", route: "/transportOrder/deleteContent" }));
+  assert.throws(() => validateNativeExport({ ...plan, dataMethod: "createExportTask" }));
+  assert.throws(() => validateNativeExport({ ...plan, filters: { unsafe_key: "\0" } }));
   for (const endpoint of ["http://erp.example/export", "https://u:password@erp.example/export", "https://erp.example/#secret"]) assert.throws(() => validateEndpoint(endpoint));
   assert.equal(validateEndpoint("http://127.0.0.1/export"), "http://127.0.0.1/export");
 });
@@ -67,7 +82,7 @@ test("临时脚本通过签名调用、下载真实Excel、隔离用户并在发
         res.write(xlsx.subarray(0, 1000)); res.end(xlsx.subarray(1000)); return;
       }
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ status: action === "ack" ? "delivered" : "ready", rowCount: mode === "overlimit" ? 10001 : mode === "wrongrows" ? 2 : 1,
+      res.end(JSON.stringify({ status: action === "ack" ? "delivered" : "ready", fileName: plan.fileName, rowCount: mode === "overlimit" ? 10001 : mode === "wrongrows" ? 2 : 1,
         bytes: xlsx.length, sha256: mode === "badhash" ? "0".repeat(64) : createHash("sha256").update(xlsx).digest("hex") }));
     } catch { res.writeHead(500); res.end(); }
   });

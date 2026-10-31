@@ -102,7 +102,6 @@ export class DesktopThreadUnavailableError extends Error {
 export class DesktopCodexClient {
   private bridgeSocket: Socket | null = null;
   private lines: Interface | null = null;
-  private desktopPipePath: string | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private controllerThreadId: string | null = null;
@@ -127,7 +126,12 @@ export class DesktopCodexClient {
 
   async start(): Promise<void> {
     this.stopped = false;
-    await this.reconnect();
+    void this.reconnect().catch((error) => {
+      // Feishu guest tasks use their own read-only App Server and must remain
+      // available while Desktop reloads an account or MCP configuration.
+      // The health timer below keeps restoring the optional Desktop mirror.
+      this.logger.warn("Codex Desktop 初始连接不可用，桥接服务继续启动并在后台恢复", errorMessage(error));
+    });
     if (!this.healthTimer && !this.stopped) {
       this.healthTimer = setInterval(() => {
         if (this.pending.size || this.reconnecting) return;
@@ -149,6 +153,13 @@ export class DesktopCodexClient {
     try { await this.connectAvailableHelper(); return; }
     catch (initialError) {
       if (this.stopped || !isDesktopTransportError(initialError)) throw initialError;
+      // Production recovery is deliberately silent. Opening codex:// links
+      // changes the user's visible page and makes normal Desktop work
+      // impossible during a prolonged outage. Tests or an explicit caller may
+      // still inject a wakeDesktop callback for controlled recovery.
+      if (!this.options.wakeDesktop) {
+        throw initialError;
+      }
       const cooldown = this.options.wakeCooldownMs ?? 60_000;
       if (this.lastWakeAt && Date.now() - this.lastWakeAt < cooldown) throw initialError;
       this.lastWakeAt = Date.now();
@@ -167,7 +178,7 @@ export class DesktopCodexClient {
       for (const threadId of candidates) {
         if (this.stopped) break;
         this.logger.warn("Desktop helper 全部不可用，正在通过会话链接唤醒", { threadId });
-        try { await (this.options.wakeDesktop ?? openDesktopThread)(threadId); }
+        try { await this.options.wakeDesktop(threadId); }
         catch (error) { lastError = error; continue; }
         const deadline = Date.now() + (this.options.wakeTimeoutMs ?? 8_000);
         while (!this.stopped && Date.now() < deadline) {
@@ -202,21 +213,20 @@ export class DesktopCodexClient {
       if (this.stopped) break;
       try { await this.connectHelperDaemon(helperPath); }
       catch (error) { errors.push(errorMessage(error)); continue; }
-      for (const socketPath of socketPaths) {
-        if (this.stopped) break;
-        try {
-          this.desktopPipePath = socketPath;
-          const ping = await this.request<{ tools?: string[] }>({ method: "ping" }, 5_000);
-          const required = ["send_message_to_thread", "read_thread", "list_threads", "list_projects", "create_thread"];
-          if (!required.every((name) => ping.tools?.includes(name))) {
-            throw new Error("Codex Desktop 缺少会话互通工具，请升级桌面应用。");
-          }
-          this.logger.info("Codex Desktop 实时会话通道已连接", { socketPath, helperPath });
-          return;
-        } catch (error) {
-          errors.push(errorMessage(error));
-          this.logger.warn("Codex Desktop 通道候选连接失败", { socketPath, error: errorMessage(error) });
+      try {
+        // helper 是 Desktop 自己启动的 MCP 子进程，它只使用宿主注入的 pipe。
+        // 客户端不再遍历并覆盖 /tmp 中的 socket，否则新版 Desktop
+        // 会将这种跨宿主连接按不受信任进程直接关闭。
+        const ping = await this.request<{ tools?: string[] }>({ method: "ping" }, 5_000);
+        const required = ["send_message_to_thread", "read_thread", "list_threads", "list_projects", "create_thread"];
+        if (!required.every((name) => ping.tools?.includes(name))) {
+          throw new Error("Codex Desktop 缺少会话互通工具，请升级桌面应用。");
         }
+        this.logger.info("Codex Desktop 实时会话通道已连接", { helperPath });
+        return;
+      } catch (error) {
+        errors.push(errorMessage(error));
+        this.logger.warn("Codex Desktop helper 连接失败", { helperPath, error: errorMessage(error) });
       }
       await this.stopHelper();
     }
@@ -568,7 +578,7 @@ export class DesktopCodexClient {
         reject,
         timer,
       });
-      const line = `${JSON.stringify({ id, desktopPipePath: this.desktopPipePath, ...payload })}\n`;
+      const line = `${JSON.stringify({ id, ...payload })}\n`;
       socket.write(line, (error) => {
         if (!error) return;
         const pending = this.pending.get(id);
@@ -630,7 +640,7 @@ export async function discoverDesktopSocketPaths(directory = "/tmp/codex-app-too
         const path = join(directory, name);
         try {
           const stat = await fs.stat(path);
-          return { path, mtimeMs: stat.mtimeMs };
+          return stat.isSocket() && stat.uid === process.getuid?.() ? { path, mtimeMs: stat.mtimeMs } : null;
         } catch {
           return null;
         }
